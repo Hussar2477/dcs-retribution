@@ -13,6 +13,7 @@ from .choicesoption import choices_option
 from .minutesoption import minutes_option
 from .optiondescription import OptionDescription, SETTING_DESCRIPTION_KEY
 from .skilloption import skill_option
+from .textoption import text_option
 from ..ato.starttype import StartType
 
 Views = ForcedOptions.Views
@@ -74,6 +75,12 @@ CAMPAIGN_DOCTRINE_PAGE = "Campaign Doctrine"
 DOCTRINE_DISTANCES_SECTION = "Doctrine distances"
 
 PRETENSE_PAGE = "Pretense"
+
+AI_OPPONENT_PAGE = "AI Opponent"
+
+LLM_COMMANDER_SECTION = "LLM Commander"
+LLM_FAIRNESS_SECTION = "Fairness and Audit"
+LLM_COST_SECTION = "Cost Controls"
 
 MISSION_GENERATOR_PAGE = "Mission Generator"
 
@@ -1474,6 +1481,170 @@ class Settings:
         default=2,
         min=1,
         max=20,
+    )
+
+    # AI Opponent (LLM commander)
+    #
+    # Everything here is off by default: with ``ai_commander_enabled`` false the
+    # campaign behaves exactly as it did before this feature existed.
+    #
+    # The provider API key is deliberately NOT a setting. Settings are pickled
+    # into the campaign save and dumped to JSON by the settings window, so a key
+    # stored here would leak with any shared save. See
+    # game.ai_commander.secretstore.
+    ai_commander_enabled: bool = boolean_option(
+        "Use an LLM commander for the OPFOR coalition",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default=False,
+        detail=(
+            "When enabled, the OPFOR coalition's turn-level strategy (spending "
+            "priorities, front priorities, front postures and target-set "
+            "priorities) is proposed by a language model instead of by the "
+            "built-in auto-planner heuristics. The model only proposes "
+            "priorities: every purchase, package, flight plan and combat result "
+            "is still produced by Retribution's own deterministic code, and "
+            "anything illegal or unaffordable is rejected and logged. Requires "
+            "an API key, configured below. If the model is unavailable the "
+            "built-in auto-planner runs instead."
+        ),
+    )
+    ai_commander_model: str = text_option(
+        "Model identifier",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default="deepseek/deepseek-v4-flash-0731",
+        placeholder="provider/model-name",
+        detail=(
+            "The provider's identifier for the model to use, exactly as the "
+            "provider spells it. Cheap models are strongly recommended: this is "
+            "a once-per-turn strategic decision, not a conversation."
+        ),
+    )
+    ai_commander_base_url: str = text_option(
+        "Provider base URL",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default="https://openrouter.ai/api/v1",
+        placeholder="https://openrouter.ai/api/v1",
+        detail=(
+            "Any endpoint that implements the OpenAI chat-completions API. "
+            "Leave as-is for OpenRouter, or point it at a local server such as "
+            "http://localhost:11434/v1 for Ollama, in which case no API key is "
+            "needed and there is no per-turn cost."
+        ),
+    )
+    ai_commander_personality: str = choices_option(
+        "Commander personality",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default="balanced",
+        choices={
+            "Cautious": "cautious",
+            "Balanced": "balanced",
+            "Aggressive": "aggressive",
+            "Attritional": "attritional",
+        },
+        detail=(
+            "Shapes how the commander is briefed. This changes the model's "
+            "preferences only; it does not change what the OPFOR coalition is "
+            "allowed to do."
+        ),
+    )
+    ai_commander_timeout_seconds: int = bounded_int_option(
+        "Request timeout (seconds)",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default=90,
+        min=10,
+        max=600,
+        detail=(
+            "A request that takes longer than this is abandoned and the "
+            "built-in auto-planner takes the turn."
+        ),
+    )
+    ai_commander_max_output_tokens: int = bounded_int_option(
+        "Maximum response tokens",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default=2000,
+        min=256,
+        max=16000,
+        detail=(
+            "Caps the size, and therefore the cost, of each response. A "
+            "commander decision is a short structured document; the default is "
+            "already generous."
+        ),
+    )
+
+    # Fairness and Audit
+    ai_commander_intel_policy: str = choices_option(
+        "Intelligence available to the AI commander",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_FAIRNESS_SECTION,
+        default="realistic",
+        choices={
+            "Realistic (recommended): only what OPFOR could plausibly observe": (
+                "realistic"
+            ),
+            "Full parity: the same complete enemy picture the Intel window "
+            "gives you": "full_parity",
+        },
+        detail=(
+            "Realistic withholds the player's budget, income, exact squadron "
+            "composition, aircraft inventory, pending purchases and the "
+            "location of undetected units, and reports the rest in bands "
+            "rather than exact numbers. Full parity matches what the Intel "
+            "window's Enemy Info checkbox already shows you, so neither side "
+            "has hidden information. Retribution has no campaign-layer fog of "
+            "war of its own, so this setting is the whole of the AI's "
+            "information limit."
+        ),
+    )
+    ai_commander_log_prompts: bool = boolean_option(
+        "Record full prompts in the decision log",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_FAIRNESS_SECTION,
+        default=True,
+        detail=(
+            "The decision log always records the intelligence snapshot, the "
+            "model's raw reply, the accepted plan and every rejected element. "
+            "This additionally stores the exact prompt text, which makes an "
+            "audit fully reproducible but also means the log file describes "
+            "your campaign. Turn it off to store only a hash of the prompt. "
+            "The API key is never written to the log either way."
+        ),
+    )
+
+    # Cost Controls
+    ai_commander_cost_cap_per_turn: float = bounded_float_option(
+        "Hard spending cap per turn (USD)",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COST_SECTION,
+        default=0.5,
+        min=0.0,
+        max=5.0,
+        divisor=100,
+        detail=(
+            "Before each request the worst-case cost of that request is "
+            "reserved against this cap using the provider's published prices. "
+            "If the reservation would exceed the cap the request is never sent "
+            "and the built-in auto-planner takes the turn. A cap of 0 disables "
+            "paid requests entirely, which is the correct setting for a local "
+            "model."
+        ),
+    )
+    ai_commander_fallback_to_builtin: bool = boolean_option(
+        "Fall back to the built-in auto-planner on any failure",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COST_SECTION,
+        default=True,
+        detail=(
+            "Strongly recommended. When disabled, a failed or refused AI "
+            "decision leaves the OPFOR coalition's strategy unchanged for that "
+            "turn instead of handing it to the built-in heuristics. Mission "
+            "generation is never blocked either way."
+        ),
     )
 
     # Cheating. Not using auto settings because the same page also has buttons which do
