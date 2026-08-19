@@ -8,6 +8,15 @@ cost.
 The window is a pure reader. It never triggers a request, never mutates the
 campaign, and works with no API key configured -- an existing log can be reviewed
 long after the key has been removed.
+
+Two record shapes exist. A COMMANDER-mode turn is one request, so it has a single
+decision and one flat list of refusals. An ACTIVE-mode turn is a sequence of
+requests -- commander intent, then logistics, then air tasking -- each with its own
+prompt, schema, refusals and cost, followed by an execution report listing every
+order that was actually pushed through Retribution's own purchase, repair,
+transfer and mission-planning code. Both shapes render here, and records written
+before ACTIVE mode existed (audit schema version 1) still open: the ACTIVE tabs
+simply report that there is nothing staged to show.
 """
 
 from __future__ import annotations
@@ -48,6 +57,40 @@ def _monospace(text: str) -> QPlainTextEdit:
     font.setFamily("Courier New")
     widget.setFont(font)
     return widget
+
+
+def _stages_of(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """The ACTIVE-mode stage entries of ``record``, or an empty list.
+
+    Version 1 records have no ``stages`` key at all, and a COMMANDER-mode
+    version 2 record has an empty one, so both answer "not staged" here.
+    """
+
+    stages = record.get("stages")
+    if not isinstance(stages, list):
+        return []
+    return [stage for stage in stages if isinstance(stage, dict)]
+
+
+def _stage_headline(stage: dict[str, Any]) -> str:
+    """A single line describing what one stage did."""
+
+    name = str(stage.get("stage") or "?")
+    if stage.get("accepted"):
+        state = "accepted"
+    elif not stage.get("ran"):
+        state = "skipped"
+    else:
+        state = "no usable output"
+    reason = stage.get("fallback_reason")
+    suffix = f" ({reason})" if reason else ""
+    tokens = (
+        f"in={stage.get('prompt_tokens') or 0} "
+        f"out={stage.get('completion_tokens') or 0} "
+        f"${float(stage.get('actual_cost') or 0):.4f}"
+    )
+    refused = len(stage.get("rejections") or [])
+    return f"{name:<12} {state}{suffix}  {tokens}  refused={refused}"
 
 
 class QAiCommanderLogWindow(QDialog):
@@ -99,6 +142,15 @@ class QAiCommanderLogWindow(QDialog):
 
         self.prompt_view = _monospace("")
         self.tabs.addTab(self.prompt_view, "Prompt and response")
+
+        self.stage_view = _monospace("")
+        self.tabs.addTab(self.stage_view, "Stages")
+
+        self.execution_view = _monospace("")
+        self.tabs.addTab(self.execution_view, "Orders executed")
+
+        self.capability_view = _monospace("")
+        self.tabs.addTab(self.capability_view, "Capabilities and targets")
 
         self.cost_view = _monospace("")
         self.tabs.addTab(self.cost_view, "Tokens and cost")
@@ -162,11 +214,19 @@ class QAiCommanderLogWindow(QDialog):
         else:
             state = f"fallback: {record.get('fallback_reason') or 'unknown'}"
         cost = record.get("actual_cost") or 0.0
-        return f"Turn {turn} - {state} (${float(cost):.4f})"
+        stages = _stages_of(record)
+        mode = ""
+        if stages:
+            accepted = sum(1 for stage in stages if stage.get("accepted"))
+            mode = f" [active {accepted}/{len(stages)}]"
+        return f"Turn {turn}{mode} - {state} (${float(cost):.4f})"
 
     def _clear_views(self) -> None:
         for view in (
             self.summary_view,
+            self.stage_view,
+            self.execution_view,
+            self.capability_view,
             self.intel_view,
             self.prompt_view,
             self.cost_view,
@@ -184,6 +244,9 @@ class QAiCommanderLogWindow(QDialog):
         record = self.records[row]
         self.summary_view.setPlainText(self._render_decision(record))
         self._render_rejections(record)
+        self.stage_view.setPlainText(self._render_stages(record))
+        self.execution_view.setPlainText(self._render_execution(record))
+        self.capability_view.setPlainText(self._render_capabilities(record))
         self.intel_view.setPlainText(self._render_intel(record))
         self.prompt_view.setPlainText(self._render_prompt(record))
         self.cost_view.setPlainText(self._render_cost(record))
@@ -195,6 +258,7 @@ class QAiCommanderLogWindow(QDialog):
             f"Turn:              {record.get('turn_id')}",
             f"Campaign revision: {record.get('campaign_revision')}",
             f"Intel policy:      {record.get('intel_policy')}",
+            f"Mode:              {record.get('mode') or 'commander'}",
             f"Personality:       {record.get('personality')}",
             f"Requested model:   {record.get('configured_model')}",
             f"Accepted:          {record.get('accepted')}",
@@ -230,6 +294,27 @@ class QAiCommanderLogWindow(QDialog):
         else:
             lines.append("No directive was accepted for this decision point.")
 
+        stages = _stages_of(record)
+        if stages:
+            lines.append("")
+            lines.append("STAGES THIS TURN")
+            for stage in stages:
+                lines.append(f"  {_stage_headline(stage)}")
+            report = record.get("execution_report")
+            if isinstance(report, dict):
+                lines.append("")
+                lines.append("EXECUTION")
+                lines.append(
+                    f"  orders applied:  {report.get('applied')}"
+                    f"   failed: {report.get('failed')}"
+                )
+                lines.append(f"  packages added:  {report.get('packages_added')}")
+                lines.append(
+                    f"  budget:          {float(report.get('budget_before') or 0):.0f}M"
+                    f" -> {float(report.get('budget_after') or 0):.0f}M"
+                    f" (spent {float(report.get('spent') or 0):.0f}M)"
+                )
+
         order = record.get("planner_task_order") or []
         if order:
             lines.append("")
@@ -244,24 +329,157 @@ class QAiCommanderLogWindow(QDialog):
             lines.extend(f"  - {note}" for note in notes)
         return "\n".join(lines)
 
+    @staticmethod
+    def _rejection_item(rejection: dict[str, Any]) -> QTreeWidgetItem:
+        value = rejection.get("value")
+        return QTreeWidgetItem(
+            [
+                str(rejection.get("element", "")),
+                str(rejection.get("reason", "")),
+                "" if value is None else json.dumps(value),
+            ]
+        )
+
     def _render_rejections(self, record: dict[str, Any]) -> None:
         self.rejection_tree.clear()
-        rejections = record.get("rejections") or []
-        for rejection in rejections:
-            if not isinstance(rejection, dict):
-                continue
-            value = rejection.get("value")
-            item = QTreeWidgetItem(
-                [
-                    str(rejection.get("element", "")),
-                    str(rejection.get("reason", "")),
-                    "" if value is None else json.dumps(value),
+        rejections = [r for r in record.get("rejections") or [] if isinstance(r, dict)]
+        stages = _stages_of(record)
+        if stages:
+            # An ACTIVE turn refuses things in three different conversations, and
+            # "which call asked for this" is the first thing an audit needs, so
+            # group by stage rather than presenting one undifferentiated list.
+            for stage in stages:
+                staged = [
+                    r for r in stage.get("rejections") or [] if isinstance(r, dict)
                 ]
-            )
-            self.rejection_tree.addTopLevelItem(item)
+                parent = QTreeWidgetItem(
+                    [str(stage.get("stage") or "?"), f"{len(staged)} refused", ""]
+                )
+                for rejection in staged:
+                    parent.addChild(self._rejection_item(rejection))
+                self.rejection_tree.addTopLevelItem(parent)
+                parent.setExpanded(True)
+        else:
+            for rejection in rejections:
+                self.rejection_tree.addTopLevelItem(self._rejection_item(rejection))
         for column in range(3):
             self.rejection_tree.resizeColumnToContents(column)
         self.tabs.setTabText(1, f"Rejected ({len(rejections)})")
+
+    @staticmethod
+    def _render_stages(record: dict[str, Any]) -> str:
+        stages = _stages_of(record)
+        if not stages:
+            return (
+                "This turn was planned in commander mode: one request, one "
+                "decision, no separate stages.\n\nSwitch the AI Opponent mode to "
+                "Active to have the model allocate the budget and write the air "
+                "tasking order itself."
+            )
+        lines: list[str] = []
+        for stage in stages:
+            lines.append(f"=== {_stage_headline(stage)}")
+            lines.append(f"  schema:   {stage.get('schema_version') or '(none)'}")
+            attempts = stage.get("attempt_indices") or []
+            lines.append(
+                "  requests: "
+                + (", ".join(f"#{index}" for index in attempts) or "(none issued)")
+            )
+            for note in stage.get("notes") or []:
+                lines.append(f"  note:     {note}")
+            parsed = stage.get("parsed_plan")
+            if isinstance(parsed, dict):
+                lines.append("  AS ASKED FOR (schema-valid, before legality checks)")
+                lines.extend(
+                    f"    {line}"
+                    for line in json.dumps(
+                        parsed, indent=2, sort_keys=True
+                    ).splitlines()
+                )
+            accepted = stage.get("accepted_plan")
+            if isinstance(accepted, dict):
+                lines.append("  AS ACCEPTED (checked against live campaign state)")
+                lines.extend(
+                    f"    {line}"
+                    for line in json.dumps(
+                        accepted, indent=2, sort_keys=True
+                    ).splitlines()
+                )
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_execution(record: dict[str, Any]) -> str:
+        report = record.get("execution_report")
+        if not isinstance(report, dict):
+            return (
+                "Nothing was executed directly by the AI this turn.\n\nIn "
+                "commander mode the model only sets priorities and Retribution's "
+                "own auto-planner does the spending and the mission planning, so "
+                "there is no order-by-order trail to show."
+            )
+        lines = [
+            f"Orders applied:  {report.get('applied')}",
+            f"Orders failed:   {report.get('failed')}",
+            f"Packages added:  {report.get('packages_added')}",
+            f"Budget before:   {float(report.get('budget_before') or 0):.0f}M",
+            f"Budget after:    {float(report.get('budget_after') or 0):.0f}M",
+            f"Spent:           {float(report.get('spent') or 0):.0f}M",
+            "",
+            "Every line below went through the same purchase, repair, transfer "
+            "and mission-planning code the player's own UI calls.",
+            "",
+        ]
+        orders = report.get("orders")
+        if not isinstance(orders, list) or not orders:
+            lines.append("(no orders were issued)")
+            return "\n".join(lines)
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            mark = "+" if order.get("applied") else "!"
+            detail = order.get("detail") or ""
+            suffix = f"  -- {detail}" if detail else ""
+            lines.append(
+                f"  {mark} [{order.get('kind')}] {order.get('description')}{suffix}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_capabilities(record: dict[str, Any]) -> str:
+        rendered = record.get("operations_rendered") or ""
+        brief = record.get("operations_brief")
+        capability_hash = record.get("capability_hash") or ""
+        operations_hash = record.get("operations_hash") or ""
+        if not (rendered or capability_hash or isinstance(brief, dict)):
+            return (
+                "No capability index or operations briefing was built for this "
+                "turn.\n\nThese are active-mode inputs: the index lists the units "
+                "and airframes OPFOR actually owns or can buy, taken from the "
+                "game's own data files, and the operations briefing lists the "
+                "bases, squadrons and observed targets it may plan against."
+            )
+        parts: list[str] = [
+            f"Capability index hash: {capability_hash or '(not built)'}",
+            f"Operations brief hash: {operations_hash or '(not built)'}",
+            "",
+            "The capability index is derived entirely from Retribution's own unit "
+            "data files and is restricted to what OPFOR owns or can purchase, so "
+            "the model cannot invent a weapon it does not have and cannot be told "
+            "anything about your order of battle.",
+            "",
+        ]
+        if rendered:
+            parts.append("OPERATIONS BRIEFING AS SENT TO THE MODEL")
+            parts.append(rendered)
+            parts.append("")
+        parts.append("FULL OPERATIONS BRIEF (serialised)")
+        parts.append(
+            json.dumps(brief, indent=2, sort_keys=True)
+            if isinstance(brief, dict)
+            else "(not recorded)"
+        )
+        return "\n".join(parts)
 
     @staticmethod
     def _render_intel(record: dict[str, Any]) -> str:

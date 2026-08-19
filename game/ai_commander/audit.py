@@ -42,7 +42,16 @@ from game.ai_commander.intel import PriorTurnSummary, RedCommanderBrief
 from game.ai_commander.serialization import canonical_json, jsonable, stable_hash
 
 #: Schema version of the record format itself, so a future reader can migrate.
-RECORD_SCHEMA_VERSION = "red-commander-audit/1"
+#:
+#: Version 2 adds the ACTIVE-mode fields (``mode``, ``capability_hash``,
+#: ``operations_hash``, ``operations_brief``, ``stages`` and
+#: ``execution_report``). Every one of them has a default, so a version 1 file
+#: still loads: readers must treat missing keys as "COMMANDER mode, no stages".
+RECORD_SCHEMA_VERSION = "red-commander-audit/2"
+
+#: The version this module first shipped with. Kept so readers can recognise
+#: pre-ACTIVE records explicitly rather than by the absence of a key.
+LEGACY_RECORD_SCHEMA_VERSION = "red-commander-audit/1"
 
 #: Sub-directory of the save directory that holds the decision log.
 AUDIT_DIRECTORY_NAME = "AiDecisions"
@@ -101,6 +110,51 @@ class LlmAttempt:
 
 
 @dataclass
+class StageRecord:
+    """One stage of an ACTIVE-mode turn.
+
+    ACTIVE mode asks the model three questions in sequence -- commander intent,
+    then logistics, then air tasking -- and each one is a separate request with
+    its own prompt, its own schema and its own validation pass. A single flat
+    record could not say which call produced which rejection, so each stage gets
+    its own entry and the top-level ``attempts`` list stays a chronological view
+    across the whole turn.
+
+    A stage that never ran (because an earlier one failed, or the cost cap was
+    reached) is still written, with ``ran`` false and ``fallback_reason`` set.
+    That is what makes a partially-degraded turn readable after the fact.
+    """
+
+    #: :class:`~game.ai_commander.plan.CommanderStage` value.
+    stage: str
+    #: Schema version the stage asked the model to satisfy.
+    schema_version: str = ""
+    #: ``True`` once at least one request was issued for this stage.
+    ran: bool = False
+    #: ``True`` when validation produced something the executor could use.
+    accepted: bool = False
+    #: Why this stage produced nothing, when it did not.
+    fallback_reason: Optional[str] = None
+    #: Indices into :attr:`AiDecisionRecord.attempts` belonging to this stage.
+    attempt_indices: list[int] = field(default_factory=list)
+    #: Schema-validated payload, before legality checking against live state.
+    parsed_plan: Optional[dict[str, Any]] = None
+    #: What survived legality checking. For COMMAND this is the directive.
+    accepted_plan: Optional[dict[str, Any]] = None
+    #: Rejections raised by this stage only. Also merged into the record-level
+    #: list so an existing reader still sees every refusal.
+    rejections: list[dict[str, Any]] = field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    #: Cost attributed to this stage, so an expensive stage is identifiable.
+    actual_cost: float = 0.0
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return jsonable(self)
+
+
+@dataclass
 class AiDecisionRecord:
     """Everything about one commander turn, successful or not."""
 
@@ -115,6 +169,9 @@ class AiDecisionRecord:
     intel_hash: str = ""
     decision_schema_hash: str = ""
     personality: str = ""
+    #: ``"commander"`` or ``"active"``. Absent in version 1 records, which were
+    #: always COMMANDER mode.
+    mode: str = ""
 
     # -- provider configuration ------------------------------------------
     base_url: str = ""
@@ -138,6 +195,22 @@ class AiDecisionRecord:
     accepted_directive: Optional[dict[str, Any]] = None
     #: Everything refused, with the reason. Never silently dropped.
     rejections: list[dict[str, Any]] = field(default_factory=list)
+
+    # -- ACTIVE mode ------------------------------------------------------
+    #: Hash of the RED capability index the prompts were rendered from. Lets a
+    #: reader tell whether two turns saw the same force description.
+    capability_hash: str = ""
+    #: Hash of the operations brief (bases, squadrons, observed targets).
+    operations_hash: str = ""
+    #: The full operations brief, alongside ``intel_brief``. Together these are
+    #: the complete "what RED could legitimately know" snapshot for ACTIVE mode.
+    operations_brief: dict[str, Any] = field(default_factory=dict)
+    #: The compact operations rendering placed in the stage 2 and 3 prompts.
+    operations_rendered: str = ""
+    #: One entry per ACTIVE stage, in execution order. Empty in COMMANDER mode.
+    stages: list[StageRecord] = field(default_factory=list)
+    #: What the executor actually managed to apply, order by order.
+    execution_report: Optional[dict[str, Any]] = None
 
     # -- what deterministic code then did ---------------------------------
     #: The order in which the HTN planner was offered its compound tasks.
@@ -193,6 +266,37 @@ class AiDecisionRecord:
         self.intel_hash = brief.content_hash()
         if include_rendered:
             self.intel_rendered = brief.render_compact()
+
+    def set_operations(
+        self,
+        brief: Any,
+        capability_hash: str,
+        include_rendered: bool,
+    ) -> None:
+        """Attach the ACTIVE-mode operations snapshot.
+
+        Typed loosely on purpose: ``audit`` must not import
+        :mod:`game.ai_commander.operations`, which reaches into the theater, or a
+        COMMANDER-mode turn would pay for machinery it never uses.
+        """
+
+        self.operations_brief = brief.to_dict()
+        self.operations_hash = brief.content_hash()
+        self.capability_hash = capability_hash
+        if include_rendered:
+            self.operations_rendered = brief.render_compact()
+
+    def stage_record(self, stage: Any) -> StageRecord:
+        """Get or create the record for ``stage``, appending in first-seen order."""
+
+        name = getattr(stage, "value", stage)
+        key = str(name)
+        for existing in self.stages:
+            if existing.stage == key:
+                return existing
+        created = StageRecord(stage=key)
+        self.stages.append(created)
+        return created
 
     def set_fallback(self, reason: FallbackReason, policy: str) -> None:
         self.accepted = False

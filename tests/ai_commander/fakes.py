@@ -27,7 +27,7 @@ from dcs.mapping import Point
 from dcs.terrain import Terrain
 
 from game.ai_commander.config import AiCommanderConfig
-from game.ai_commander.enums import CommanderPersonality, IntelPolicy
+from game.ai_commander.enums import CommanderMode, CommanderPersonality, IntelPolicy
 from game.ai_commander.llmclient import (
     ChatCompletionClient,
     LlmError,
@@ -35,10 +35,13 @@ from game.ai_commander.llmclient import (
     TokenUsage,
 )
 from game.ai_commander.serialization import canonical_json
+from game.ato.flighttype import FlightType
+from game.data.units import UnitClass
 from game.ground_forces.combat_stance import CombatStance
 from game.theater.controlpoint import ControlPoint
 from game.theater.player import Player
 from game.theater.theatergroundobject import IadsGroundObject
+from game.utils import Distance, nautical_miles
 
 # ---------------------------------------------------------------------------
 # Sentinels
@@ -165,6 +168,7 @@ class FakeAllocations:
 @dataclass
 class FakeRunwayStatus:
     needs_repair: bool = False
+    repair_turns_remaining: Optional[int] = None
 
 
 @dataclass
@@ -191,6 +195,110 @@ class FakeFrontLine:
         return self.hostile if player.is_red else self.friendly
 
 
+@dataclass
+class FakeSkynetProperties:
+    """The three Skynet fields the capability index reads.
+
+    The real unit definitions store these as *strings* loaded from YAML, so the
+    fake stores strings too: the index normalises ``"true"`` itself, and a fake
+    that handed it booleans would hide that conversion.
+    """
+
+    can_engage_harm: Optional[str] = None
+    can_engage_air_weapon: Optional[str] = None
+    engagement_zone: Optional[str] = None
+
+
+@dataclass(eq=False)
+class FakeUnitType:
+    """One aircraft, ground unit or ship type.
+
+    ``eq=False`` is load bearing. Retribution's real unit types are cached
+    singletons compared by identity, and both the capability index
+    (``set(faction.ground_units)``) and ``Base.armor`` use them as dictionary and
+    set keys. A default dataclass would set ``__hash__`` to ``None`` and make the
+    fake unusable in exactly the places the code under test needs it.
+    """
+
+    name: str
+    price: int
+    year_introduced: str = "1985"
+    role: str = "Multirole"
+    unit_class: UnitClass = UnitClass.TANK
+    helicopter: bool = False
+    flyable: bool = False
+    carrier_capable: bool = False
+    lha_capable: bool = False
+    has_built_in_target_pod: bool = False
+    has_built_in_ecm: bool = False
+    can_carry_crates: bool = False
+    max_group_size: int = 4
+    max_mission_range: Distance = field(default_factory=lambda: nautical_miles(500))
+    task_priorities: dict[FlightType, int] = field(default_factory=dict)
+    skynet_properties: FakeSkynetProperties = field(
+        default_factory=FakeSkynetProperties
+    )
+
+    @property
+    def variant_id(self) -> str:
+        return self.name
+
+    @property
+    def display_name(self) -> str:
+        return self.name
+
+    def capable_of(self, task: FlightType) -> bool:
+        return task in self.task_priorities
+
+
+@dataclass
+class FakeDoctrine:
+    """The doctrine flags the capability index summarises."""
+
+    name: str = "Red Doctrine"
+    cas: bool = True
+    cap: bool = True
+    sead: bool = True
+    strike: bool = True
+    antiship: bool = False
+
+
+@dataclass
+class FakeBase:
+    """``ControlPoint.base``: the ground units physically parked at a base."""
+
+    armor: dict[Any, int] = field(default_factory=dict)
+
+    def total_units_of_type(self, unit_type: Any) -> int:
+        return self.armor.get(unit_type, 0)
+
+    def commit_losses(self, units: dict[Any, int]) -> None:
+        """Remove units from the base, as a departing transfer does."""
+
+        for unit_type, count in units.items():
+            remaining = self.armor.get(unit_type, 0) - count
+            if remaining > 0:
+                self.armor[unit_type] = remaining
+            else:
+                self.armor.pop(unit_type, None)
+
+
+class FakeGroundUnitOrders:
+    """``ControlPoint.ground_unit_orders``, recording what was ordered."""
+
+    def __init__(self) -> None:
+        self.orders: list[dict[Any, int]] = []
+
+    def order(self, units: dict[Any, int]) -> None:
+        self.orders.append(dict(units))
+
+    def total_units_of_type(self, unit_type: Any) -> int:
+        return sum(order.get(unit_type, 0) for order in self.orders)
+
+    def ordered_count(self, unit_type: Any) -> int:
+        return self.total_units_of_type(unit_type)
+
+
 def make_control_point(
     *,
     cp_id: int,
@@ -212,6 +320,12 @@ def make_control_point(
     active_frontline: bool = False,
     ground_objects: Optional[Sequence[Any]] = None,
     stances: Optional[dict[int, CombatStance]] = None,
+    parking_free: int = 0,
+    repair_turns_remaining: Optional[int] = None,
+    armor: Optional[dict[Any, int]] = None,
+    squadrons: Optional[Sequence[Any]] = None,
+    can_operate: bool = True,
+    is_global: bool = False,
 ) -> ControlPoint:
     """A control point exposing every attribute the commander code reads."""
 
@@ -225,9 +339,9 @@ def make_control_point(
     cp.income_per_turn = income_per_turn
     cp.ground_objects = list(ground_objects or [])
     cp.stances = dict(stances or {})
-    cp.is_global = False
+    cp.is_global = is_global
     cp.has_active_frontline = active_frontline
-    cp.runway_status = FakeRunwayStatus(runway_needs_repair)
+    cp.runway_status = FakeRunwayStatus(runway_needs_repair, repair_turns_remaining)
     cp.runway_can_be_repaired = runway_repairable
     cp.runway_is_operational = MagicMock(return_value=runway_operational)
     cp.has_ground_unit_source = MagicMock(return_value=ground_unit_source)
@@ -239,6 +353,20 @@ def make_control_point(
         return_value=FakeAllocations(ground_present, ground_ordered)
     )
     cp.is_friendly = lambda player: bool(captured is player)
+
+    # -- surfaces only ACTIVE mode touches --------------------------------
+    # A spec'd mock would return a MagicMock from each of these, which the
+    # projector and legality checker defensively swallow. Wiring them explicitly
+    # is what makes an ACTIVE-mode assertion meaningful rather than vacuous.
+    cp.unclaimed_parking = MagicMock(return_value=parking_free)
+    cp.base = FakeBase(dict(armor or {}))
+    cp.ground_unit_orders = FakeGroundUnitOrders()
+    cp.squadrons = list(squadrons or [])
+    cp.can_operate = MagicMock(return_value=can_operate)
+    cp.begin_runway_repair = MagicMock()
+    cp.is_carrier = False
+    cp.is_lha = False
+    cp.is_fleet = False
     return cast(ControlPoint, cp)
 
 
@@ -254,24 +382,89 @@ def make_iads(name: str, position: Point) -> Any:
 
 
 @dataclass
-class FakeUnitType:
-    name: str
-    price: int
-
-
-@dataclass
 class FakeSquadron:
+    """A squadron exposing the player-equivalent controls ACTIVE mode drives.
+
+    Relocation and re-tasking record what they were asked to do instead of
+    silently succeeding, so an execution test can prove the order reached the
+    squadron rather than merely that nothing raised.
+    """
+
     name: str
     aircraft: FakeUnitType
     pilot_count: int = 0
+    location: Any = None
+    destination: Any = None
+    owned_aircraft: int = 0
+    untasked_aircraft: int = 0
+    pending_deliveries: int = 0
+    max_size: int = 24
+    pilot_limits_enabled: bool = False
+    capable_tasks: frozenset[FlightType] = frozenset()
+    auto_assignable_mission_types: set[FlightType] = field(default_factory=set)
+    #: Back-reference the real ``ParkingType.from_squadron`` walks to reach the
+    #: game settings. Wired up by :class:`SyntheticCampaign`.
+    coalition: Any = None
+    #: Recorded calls. ``None`` in ``relocations`` is a cancellation.
+    relocations: list[Any] = field(default_factory=list)
+    tasking_calls: list[frozenset[FlightType]] = field(default_factory=list)
+
+    def capable_of(self, task: FlightType) -> bool:
+        return task in self.capable_tasks
+
+    def has_aircraft_capacity_for(self, count: int) -> bool:
+        return self.max_size - self.owned_aircraft - self.pending_deliveries >= count
+
+    @property
+    def number_of_available_pilots(self) -> int:
+        return self.pilot_count
+
+    @property
+    def max_fulfillable_aircraft(self) -> int:
+        return min(self.untasked_aircraft, self.pilot_count)
+
+    @property
+    def expected_size_next_turn(self) -> int:
+        return self.owned_aircraft + self.pending_deliveries
+
+    def plan_relocation(self, destination: Any, now: Any) -> None:
+        self.relocations.append(destination)
+        self.destination = destination
+
+    def cancel_relocation(self) -> None:
+        self.relocations.append(None)
+        self.destination = None
+
+    def set_auto_assignable_mission_types(self, mission_types: Any) -> None:
+        # The real squadron filters through ``capable_of``, so the fake does too:
+        # a test must not be able to prove that an incapable task was accepted.
+        allowed = frozenset(task for task in mission_types if self.capable_of(task))
+        self.tasking_calls.append(allowed)
+        self.auto_assignable_mission_types = set(allowed)
 
 
 @dataclass
 class FakeAirWing:
     squadrons: list[FakeSquadron] = field(default_factory=list)
+    #: When empty, auto-plannability is derived from the squadrons themselves.
+    auto_plannable: frozenset[FlightType] = frozenset()
 
     def iter_squadrons(self) -> Iterator[FakeSquadron]:
         return iter(self.squadrons)
+
+    def squadrons_for(self, aircraft: Any) -> list[FakeSquadron]:
+        return [
+            squadron for squadron in self.squadrons if squadron.aircraft is aircraft
+        ]
+
+    def can_auto_plan(self, task: FlightType) -> bool:
+        if self.auto_plannable:
+            return task in self.auto_plannable
+        return any(squadron.capable_of(task) for squadron in self.squadrons)
+
+    @property
+    def size(self) -> int:
+        return sum(squadron.owned_aircraft for squadron in self.squadrons)
 
 
 @dataclass
@@ -279,6 +472,25 @@ class FakeFaction:
     name: str
     frontline_units: list[FakeUnitType] = field(default_factory=list)
     artillery_units: list[FakeUnitType] = field(default_factory=list)
+    aircraft: list[FakeUnitType] = field(default_factory=list)
+    awacs: list[FakeUnitType] = field(default_factory=list)
+    tankers: list[FakeUnitType] = field(default_factory=list)
+    infantry_units: list[FakeUnitType] = field(default_factory=list)
+    logistics_units: list[FakeUnitType] = field(default_factory=list)
+    air_defense_units: list[FakeUnitType] = field(default_factory=list)
+    missiles: list[FakeUnitType] = field(default_factory=list)
+    naval_units: list[FakeUnitType] = field(default_factory=list)
+    carriers: list[FakeUnitType] = field(default_factory=list)
+    cargo_ship: Optional[FakeUnitType] = None
+    has_jtac: bool = False
+    jtac_unit: Optional[FakeUnitType] = None
+    doctrine: FakeDoctrine = field(default_factory=FakeDoctrine)
+
+    @property
+    def ground_units(self) -> list[FakeUnitType]:
+        """Mirrors the real property: what the human purchase screen offers."""
+
+        return [*self.artillery_units, *self.frontline_units, *self.logistics_units]
 
 
 class _EmptyMovementPool:
@@ -286,12 +498,50 @@ class _EmptyMovementPool:
         return []
 
 
+class FakeTransitNetwork:
+    """A transit network that either has a route or raises, like the real one."""
+
+    def __init__(self, reachable: bool = True) -> None:
+        self.reachable = reachable
+        self.queries: list[tuple[Any, Any]] = []
+
+    def shortest_path_between(self, origin: Any, destination: Any) -> list[Any]:
+        self.queries.append((origin, destination))
+        if not self.reachable:
+            raise RuntimeError(
+                f"No path from {getattr(origin, 'name', origin)} to "
+                f"{getattr(destination, 'name', destination)}"
+            )
+        return [origin, destination]
+
+
 class FakeTransfers:
     """Enough of ``PendingTransfers`` for the projector and procurement."""
 
-    def __init__(self) -> None:
+    def __init__(self, reachable: bool = True) -> None:
         self.convoys = _EmptyMovementPool()
         self.cargo_ships = _EmptyMovementPool()
+        self.network = FakeTransitNetwork(reachable)
+        self.orders: list[Any] = []
+
+    def network_for(self, control_point: Any) -> FakeTransitNetwork:
+        return self.network
+
+    def new_transfer(self, transfer: Any, now: Any) -> None:
+        # The real implementation debits the origin before arranging transport, so
+        # the fake does the same: a transfer test can then prove the units left.
+        transfer.origin.base.commit_losses(transfer.units)
+        self.orders.append(transfer)
+
+
+class FakeAto:
+    """``coalition.ato``, recording the packages the commander added."""
+
+    def __init__(self) -> None:
+        self.packages: list[Any] = []
+
+    def add_package(self, package: Any) -> None:
+        self.packages.append(package)
 
 
 class FakeCoalition:
@@ -302,15 +552,22 @@ class FakeCoalition:
         budget: float,
         air_wing: FakeAirWing,
         packages: Optional[list[str]] = None,
+        transit_reachable: bool = True,
     ) -> None:
         self.player = player
         self.faction = faction
         self.budget = budget
         self.air_wing = air_wing
-        self.transfers = FakeTransfers()
+        self.transfers = FakeTransfers(reachable=transit_reachable)
         self.packages = list(packages or [])
+        self.ato = FakeAto()
+        self.budget_adjustments: list[float] = []
         self.game: Any = None
         self._opponent: Optional[FakeCoalition] = None
+
+    def adjust_budget(self, amount: float) -> None:
+        self.budget_adjustments.append(amount)
+        self.budget += amount
 
     @property
     def opponent(self) -> FakeCoalition:
@@ -351,6 +608,10 @@ class FakeSettings:
         self.motorpool_enabled = False
         self.motorpool_spawn_cap = 0
         self.automate_front_line_stance = True
+        # Read by ``ParkingType.from_squadron`` and ``has_aircraft_capacity_for``,
+        # both of which ACTIVE-mode legality checking walks through.
+        self.ground_start_ai_planes = True
+        self.enable_squadron_aircraft_limits = True
 
 
 class SyntheticCampaign:
@@ -369,17 +630,126 @@ class SyntheticCampaign:
     posture including ``BREAKTHROUGH`` passes the game's own force-balance
     precondition. That is deliberate: a campaign where nothing was legal would
     make the legality tests untrustworthy.
+
+    For ACTIVE mode the two RED bases are deliberately asymmetric:
+
+    * ``RED-FRONT-BASE`` hosts ``RED SQN 1`` (fighters), has free parking, a
+      working runway, armour on strength and a ground unit source.
+    * ``RED-REAR-BASE`` hosts ``RED SQN 2`` (bombers) and has a broken but
+      repairable runway, so runway repair and relocation both have somewhere
+      legal to happen.
     """
 
     NEAR_IADS = 2
     FAR_IADS = 3
+
+    #: Free parking spaces, chosen so purchase clamping is observable.
+    FRONT_PARKING = 6
+    REAR_PARKING = 20
 
     def __init__(
         self,
         red_budget: Optional[float] = None,
         red_deployable: Optional[int] = None,
         turn: int = 7,
+        transit_reachable: bool = True,
     ) -> None:
+        self.red_tank = FakeUnitType(
+            "RED-TANK", 12, unit_class=UnitClass.TANK, role="Main battle tank"
+        )
+        self.red_artillery = FakeUnitType(
+            "RED-ARTY", 18, unit_class=UnitClass.ARTILLERY, role="Self propelled gun"
+        )
+        self.red_truck = FakeUnitType(
+            "RED-TRUCK", 4, unit_class=UnitClass.LOGISTICS, role="Supply truck"
+        )
+        self.red_sam = FakeUnitType(
+            "RED-SAM",
+            40,
+            unit_class=UnitClass.TELAR,
+            role="Medium range SAM",
+            skynet_properties=FakeSkynetProperties(
+                can_engage_harm="true",
+                can_engage_air_weapon="false",
+                engagement_zone="EngageRange",
+            ),
+        )
+        self.red_jet = FakeUnitType(
+            "RED-JET",
+            22,
+            role="Multirole fighter",
+            unit_class=UnitClass.PLANE,
+            flyable=True,
+            has_built_in_ecm=True,
+            max_group_size=4,
+            max_mission_range=nautical_miles(400),
+            task_priorities={
+                FlightType.BARCAP: 3,
+                FlightType.TARCAP: 2,
+                FlightType.ESCORT: 2,
+                FlightType.CAS: 1,
+                FlightType.SEAD: 1,
+            },
+        )
+        self.red_bomber = FakeUnitType(
+            "RED-BOMBER",
+            34,
+            role="Bomber",
+            unit_class=UnitClass.PLANE,
+            flyable=True,
+            has_built_in_target_pod=True,
+            max_group_size=2,
+            max_mission_range=nautical_miles(900),
+            task_priorities={
+                FlightType.STRIKE: 3,
+                FlightType.DEAD: 2,
+                FlightType.BAI: 1,
+            },
+        )
+        #: An airframe RED's faction lists but has no squadron for, so the
+        #: capability index has a non-fielded entry to test against.
+        self.red_unfielded_jet = FakeUnitType(
+            "RED-INTERCEPTOR",
+            48,
+            role="Interceptor",
+            unit_class=UnitClass.PLANE,
+            flyable=True,
+            max_group_size=2,
+            task_priorities={FlightType.BARCAP: 2, FlightType.SWEEP: 3},
+        )
+
+        # Squadrons are built before the bases so each base can list them, then
+        # given their ``location`` once the bases exist.
+        self.red_squadron_1 = FakeSquadron(
+            "RED SQN 1",
+            self.red_jet,
+            11,
+            owned_aircraft=8,
+            untasked_aircraft=6,
+            pending_deliveries=1,
+            capable_tasks=frozenset(
+                {
+                    FlightType.BARCAP,
+                    FlightType.TARCAP,
+                    FlightType.ESCORT,
+                    FlightType.CAS,
+                    FlightType.SEAD,
+                }
+            ),
+            auto_assignable_mission_types={FlightType.BARCAP},
+        )
+        self.red_squadron_2 = FakeSquadron(
+            "RED SQN 2",
+            self.red_bomber,
+            9,
+            owned_aircraft=4,
+            untasked_aircraft=4,
+            capable_tasks=frozenset(
+                {FlightType.STRIKE, FlightType.DEAD, FlightType.BAI}
+            ),
+            auto_assignable_mission_types={FlightType.STRIKE},
+        )
+
         self.red_front_base = make_control_point(
             cp_id=1,
             name=cast(str, RED_SENTINELS["red_base_name"]),
@@ -398,6 +768,9 @@ class SyntheticCampaign:
             income_per_turn=cast(int, RED_SENTINELS["red_income_per_turn"]),
             active_frontline=True,
             stances={20: CombatStance.DEFENSIVE},
+            parking_free=self.FRONT_PARKING,
+            armor={self.red_tank: 9, self.red_artillery: 3},
+            squadrons=[self.red_squadron_1],
         )
         self.red_rear_base = make_control_point(
             cp_id=2,
@@ -410,7 +783,13 @@ class SyntheticCampaign:
             runway_operational=False,
             runway_needs_repair=True,
             runway_repairable=True,
+            parking_free=self.REAR_PARKING,
+            repair_turns_remaining=2,
+            armor={self.red_tank: 5, self.red_truck: 2},
+            squadrons=[self.red_squadron_2],
         )
+        self.red_squadron_1.location = self.red_front_base
+        self.red_squadron_2.location = self.red_rear_base
 
         near_iads = [
             make_iads(f"BLUE SAM near {index}", point(30_000.0, 1_000.0 * index))

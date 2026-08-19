@@ -1509,6 +1509,31 @@ class Settings:
             "built-in auto-planner runs instead."
         ),
     )
+    ai_commander_mode: str = choices_option(
+        "How much of the turn the LLM commander runs",
+        page=AI_OPPONENT_PAGE,
+        section=LLM_COMMANDER_SECTION,
+        default="commander",
+        choices={
+            "Commander: strategy only, one request per turn": "commander",
+            "Active: strategy, logistics and mission tasking, three requests "
+            "per turn": "active",
+        },
+        detail=(
+            "Commander mode asks the model for turn-level priorities only and "
+            "lets the built-in auto-planner spend the money and write the air "
+            "tasking order. Active mode gives the model the same controls a "
+            "human player has: after setting strategy it allocates the budget "
+            "itself (aircraft and ground unit purchases, runway repairs, "
+            "squadron relocations and tasking, ground transfers) and then "
+            "plans individual packages and flights against the targets it can "
+            "see. Active mode makes three requests per turn instead of one, so "
+            "it costs roughly three times as much; the per-turn spending cap "
+            "below still covers the whole turn, and any stage that fails or "
+            "runs out of budget simply hands that part of the turn back to the "
+            "built-in auto-planner."
+        ),
+    )
     ai_commander_model: str = text_option(
         "Model identifier",
         page=AI_OPPONENT_PAGE,

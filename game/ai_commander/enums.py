@@ -34,6 +34,33 @@ class IntelPolicy(Enum):
 
 
 @unique
+class CommanderMode(Enum):
+    """How much of RED's turn the model is allowed to drive.
+
+    The two modes differ only in how many decisions are delegated, never in what
+    RED is allowed to know or to do. Both are subject to the same intel policy,
+    the same legality checks and the same per-turn cost cap.
+    """
+
+    #: One request per turn. The model sets strategy, priorities, spending order
+    #: and front postures, and Retribution's own deterministic staff -- the HTN
+    #: theater commander and the procurement AI -- carry them out. Cheapest, and
+    #: the safest default because the model cannot express an illegal action at
+    #: all: it only ever reorders the built-in planner's own preferences.
+    COMMANDER = "commander"
+
+    #: Three requests per turn: command intent, then logistics, then air tasking.
+    #: The model exercises the same controls a human player has -- buying
+    #: aircraft and ground units, repairing runways, relocating and re-tasking
+    #: squadrons, moving ground units through the transit network, and planning
+    #: individual packages and flights. Every order is re-checked against live
+    #: state and applied through the same APIs the Qt UI calls, so it cannot
+    #: overspend, overfill parking or task a squadron with a mission its
+    #: airframe cannot fly.
+    ACTIVE = "active"
+
+
+@unique
 class RedStrategy(Enum):
     """The single overall posture the commander picks for the turn."""
 

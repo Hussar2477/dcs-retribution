@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
 from game.ai_commander.enums import (
+    CommanderMode,
     CommanderPersonality,
     IntelPolicy,
 )
@@ -62,6 +63,10 @@ class AiCommanderConfig:
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
     api_key: Optional[str] = None
+    #: How much of the turn the model drives. Defaults to the cheaper, more
+    #: conservative single-request mode so an upgrade never silently triples a
+    #: user's per-turn spend.
+    mode: CommanderMode = CommanderMode.COMMANDER
     personality: CommanderPersonality = CommanderPersonality.BALANCED
     intel_policy: IntelPolicy = IntelPolicy.REALISTIC
     cost_cap_per_turn: float = 0.5
@@ -98,6 +103,20 @@ class AiCommanderConfig:
         return True
 
     @property
+    def is_active_mode(self) -> bool:
+        return self.mode is CommanderMode.ACTIVE
+
+    @property
+    def requests_per_turn(self) -> int:
+        """How many completions a clean turn needs, excluding repairs.
+
+        Used to sanity-check the cost cap: ACTIVE mode makes three requests, so a
+        cap that only covers one would fail mid-hierarchy every turn.
+        """
+
+        return 3 if self.is_active_mode else 1
+
+    @property
     def allows_paid_requests(self) -> bool:
         """A zero cap forbids anything that could be billed."""
 
@@ -108,7 +127,8 @@ class AiCommanderConfig:
 
         return (
             f"model={self.model} base_url={self.base_url} "
-            f"key={mask(self.api_key)} personality={self.personality.value} "
+            f"key={mask(self.api_key)} mode={self.mode.value} "
+            f"personality={self.personality.value} "
             f"intel={self.intel_policy.value} cap=${self.cost_cap_per_turn:.2f}"
         )
 
@@ -119,6 +139,7 @@ class AiCommanderConfig:
             "enabled": self.enabled,
             "model": self.model,
             "base_url": self.base_url,
+            "mode": self.mode.value,
             "personality": self.personality.value,
             "intel_policy": self.intel_policy.value,
             "cost_cap_per_turn": self.cost_cap_per_turn,
@@ -163,6 +184,12 @@ class AiCommanderConfig:
         elif not base_url.startswith(("http://", "https://")):
             problems.append(f"provider base URL {base_url!r} is not an http(s) URL")
 
+        mode = _enum_or_default(
+            CommanderMode,
+            getattr(settings, "ai_commander_mode", None),
+            CommanderMode.COMMANDER,
+            "commander mode",
+        )
         personality = _enum_or_default(
             CommanderPersonality,
             getattr(settings, "ai_commander_personality", None),
@@ -209,6 +236,7 @@ class AiCommanderConfig:
             model=model or DEFAULT_MODEL,
             base_url=base_url or DEFAULT_BASE_URL,
             api_key=api_key,
+            mode=mode,
             personality=personality,
             intel_policy=intel_policy,
             cost_cap_per_turn=cap,
@@ -238,6 +266,7 @@ class AiCommanderConfig:
             model=config.model,
             base_url=config.base_url,
             api_key=config.api_key,
+            mode=config.mode,
             personality=config.personality,
             intel_policy=config.intel_policy,
             cost_cap_per_turn=config.cost_cap_per_turn,
