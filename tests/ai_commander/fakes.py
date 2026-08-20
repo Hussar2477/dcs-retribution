@@ -19,6 +19,7 @@ brief would pass every leak test.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Sequence, cast
 from unittest.mock import MagicMock
@@ -614,6 +615,20 @@ class FakeSettings:
         self.enable_squadron_aircraft_limits = True
 
 
+class FakeConditions:
+    """``game.conditions``; only the mission start time is read."""
+
+    def __init__(self) -> None:
+        self.start_time = datetime(2024, 6, 1, 12, 0, 0)
+
+
+class FakeGameDb:
+    """``game.db``; ``PackageFulfiller`` is handed ``db.flights``."""
+
+    def __init__(self) -> None:
+        self.flights: dict[Any, Any] = {}
+
+
 class SyntheticCampaign:
     """A one-front toy campaign with sentinel-marked BLUE state.
 
@@ -837,26 +852,33 @@ class SyntheticCampaign:
             "Syria", self.control_points, [cast(Any, self.front)]
         )
 
-        self.red = FakeCoalition(
+        # Typed ``Any`` (like ``synthetic_game()``'s ``game``) so tests can pass
+        # the coalition to real APIs typed against ``Coalition`` without a cast
+        # at every call site; the fake implements the surface those APIs use.
+        self.red: Any = FakeCoalition(
             player=Player.RED,
             faction=FakeFaction(
                 "Red Sentinel Faction",
-                frontline_units=[FakeUnitType("RED-TANK", 12)],
-                artillery_units=[FakeUnitType("RED-ARTY", 18)],
+                # The shared instances wired into the bases and squadrons above
+                # are reused verbatim: identity matters, because the capability
+                # index, legality checker and execution adapters all compare the
+                # objects the model names against the objects the faction owns.
+                frontline_units=[self.red_tank],
+                artillery_units=[self.red_artillery],
+                logistics_units=[self.red_truck],
+                air_defense_units=[self.red_sam],
+                aircraft=[self.red_jet, self.red_bomber, self.red_unfielded_jet],
+                doctrine=FakeDoctrine(),
             ),
             budget=(
                 cast(float, RED_SENTINELS["red_budget"])
                 if red_budget is None
                 else red_budget
             ),
-            air_wing=FakeAirWing(
-                [
-                    FakeSquadron("RED SQN 1", FakeUnitType("RED-JET", 22), 11),
-                    FakeSquadron("RED SQN 2", FakeUnitType("RED-BOMBER", 34), 9),
-                ]
-            ),
+            air_wing=FakeAirWing([self.red_squadron_1, self.red_squadron_2]),
+            transit_reachable=transit_reachable,
         )
-        self.blue = FakeCoalition(
+        self.blue: Any = FakeCoalition(
             player=Player.BLUE,
             faction=FakeFaction(
                 "Blue Faction", frontline_units=[FakeUnitType("BLUE-TANK", 14)]
@@ -880,10 +902,20 @@ class SyntheticCampaign:
         self.blue._opponent = self.red
         self.red.game = self
         self.blue.game = self
+        # The real ``ParkingType.from_squadron`` walks
+        # ``squadron.coalition.game.settings.ground_start_ai_planes``; wiring the
+        # back-reference lets legality checking run through the real parking code.
+        self.red_squadron_1.coalition = self.red
+        self.red_squadron_2.coalition = self.red
 
         self.settings = FakeSettings()
         self.turn = turn
         self.threat_zone = FakeThreatZone(covers=False)
+        # ``PlanExecutor.now`` reads ``game.conditions.start_time`` and
+        # ``execute_air_tasking`` reads ``game.db.flights``; both are present so
+        # execution runs through the real code rather than a defensive branch.
+        self.conditions = FakeConditions()
+        self.db = FakeGameDb()
 
     # -- the ``Game`` surface the commander uses --------------------------
 
@@ -898,11 +930,15 @@ def synthetic_game(
     red_budget: Optional[float] = None,
     red_deployable: Optional[int] = None,
     turn: int = 7,
+    transit_reachable: bool = True,
 ) -> tuple[SyntheticCampaign, Any]:
     """A campaign plus the value to pass where a ``Game`` is expected."""
 
     campaign = SyntheticCampaign(
-        red_budget=red_budget, red_deployable=red_deployable, turn=turn
+        red_budget=red_budget,
+        red_deployable=red_deployable,
+        turn=turn,
+        transit_reachable=transit_reachable,
     )
     return campaign, cast(Any, campaign)
 
@@ -996,6 +1032,7 @@ def make_config(
     base_url: str = "https://openrouter.ai/api/v1",
     intel_policy: IntelPolicy = IntelPolicy.REALISTIC,
     personality: CommanderPersonality = CommanderPersonality.BALANCED,
+    mode: CommanderMode = CommanderMode.COMMANDER,
     cost_cap_per_turn: float = 0.5,
     max_output_tokens: int = 2000,
     log_prompts: bool = True,
@@ -1010,6 +1047,7 @@ def make_config(
         api_key=api_key,
         personality=personality,
         intel_policy=intel_policy,
+        mode=mode,
         cost_cap_per_turn=cost_cap_per_turn,
         max_output_tokens=max_output_tokens,
         log_prompts=log_prompts,

@@ -19,11 +19,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
+from game.ai_commander.activeprompt import (
+    build_stage_messages,
+    build_stage_repair_messages,
+    stage_response_format,
+)
 from game.ai_commander.audit import AuditLog
+from game.ai_commander.capabilities import CAPABILITY_CACHE, capability_index_for
 from game.ai_commander.controller import RedCommanderTurn
 from game.ai_commander.decision import decision_json_schema, example_decision_json
 from game.ai_commander.enums import CommanderPersonality, IntelPolicy
@@ -32,6 +38,12 @@ from game.ai_commander.intel import (
     REALISTIC_WITHHELD_FIELDS,
     IntelProjector,
     RedCommanderBrief,
+)
+from game.ai_commander.operations import OperationsBrief, OperationsProjector
+from game.ai_commander.plan import (
+    CommanderStage,
+    example_air_tasking_json,
+    example_logistics_json,
 )
 from game.ai_commander.prompt import build_messages
 from tests.ai_commander import fakes
@@ -301,3 +313,182 @@ class TestProjectionIsStable:
         _, moved = fakes.synthetic_game(red_deployable=999)
         changed = IntelProjector(moved, IntelPolicy.REALISTIC).project()
         assert changed.campaign_revision != baseline.campaign_revision
+
+
+# ---------------------------------------------------------------------------
+# ACTIVE mode: the leak surface is three times larger
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _fresh_capability_cache() -> Iterator[None]:
+    CAPABILITY_CACHE.clear()
+    yield
+    CAPABILITY_CACHE.clear()
+
+
+def _active_projection(
+    policy: IntelPolicy,
+) -> tuple[fakes.SyntheticCampaign, RedCommanderBrief, OperationsBrief, Any]:
+    """The full trio the ACTIVE prompts are built from.
+
+    ACTIVE mode adds two whole artefacts to the leak surface -- the capability
+    index and the operations briefing -- and shows all three across three
+    separate prompts. Each is derived from the same campaign, so each is scanned
+    for the same sentinels.
+    """
+
+    campaign, game = fakes.synthetic_game()
+    brief = IntelProjector(game, policy).project()
+    ops = OperationsProjector(game, policy).project(
+        brief.campaign_id_hash, brief.campaign_revision
+    )
+    capabilities = capability_index_for(campaign.red)
+    return campaign, brief, ops, capabilities
+
+
+def _everything_a_stage_sends(
+    stage: CommanderStage,
+    brief: RedCommanderBrief,
+    ops: OperationsBrief,
+    capabilities: Any,
+) -> str:
+    """Serialise every artefact a single ACTIVE stage ships to the model.
+
+    The initial prompt (both personalities, because personality text is
+    interpolated), the repair prompt -- which re-sends the whole briefing -- and
+    the response-format schema are all built from the same projection, and any
+    one of them leaking would be a leak.
+    """
+
+    prior = "prior stage decisions summarised for the next stage"
+    return fakes.serialise_everything(
+        build_stage_messages(
+            stage, brief, ops, capabilities, CommanderPersonality.BALANCED, prior
+        ),
+        build_stage_messages(
+            stage, brief, ops, capabilities, CommanderPersonality.AGGRESSIVE, prior
+        ),
+        build_stage_repair_messages(
+            stage,
+            brief,
+            ops,
+            capabilities,
+            CommanderPersonality.BALANCED,
+            previous_response='{"schema_version": "wrong"}',
+            error_summary="schema_version was wrong",
+            prior_stage_summary=prior,
+        ),
+        stage_response_format(stage, brief, ops, capabilities, True, True),
+        stage_response_format(stage, brief, ops, capabilities, False, False),
+    )
+
+
+class TestActiveStagesWithholdBlueInformation:
+    @pytest.mark.parametrize("stage", list(CommanderStage))
+    def test_no_blue_sentinel_appears_in_any_stage_prompt(
+        self, stage: CommanderStage
+    ) -> None:
+        _, brief, ops, capabilities = _active_projection(IntelPolicy.REALISTIC)
+        blob = _everything_a_stage_sends(stage, brief, ops, capabilities)
+        assert fakes.blue_leaks_in(blob) == []
+
+    @pytest.mark.parametrize("stage", list(CommanderStage))
+    def test_red_still_sees_its_own_state_in_every_stage(
+        self, stage: CommanderStage
+    ) -> None:
+        # Every stage embeds the intelligence briefing, so RED's own force
+        # numbers and base names must survive -- otherwise "no leaks" would be
+        # vacuous.
+        _, brief, ops, capabilities = _active_projection(IntelPolicy.REALISTIC)
+        blob = _everything_a_stage_sends(stage, brief, ops, capabilities)
+        # The compact renderer glues an "M" onto the economy figures
+        # (e.g. "budget=1357911M"), which defeats the word-boundary matcher, so
+        # only those two may be reported missing -- everything else must survive.
+        assert set(fakes.red_facts_missing_from(blob)) <= {
+            "red_budget",
+            "red_income_per_turn",
+        }
+        # ...and the economy digits are plainly present, just suffixed.
+        assert str(int(float(str(fakes.RED_SENTINELS["red_budget"])))) in blob
+        assert str(fakes.RED_SENTINELS["red_income_per_turn"]) in blob
+
+    def test_the_operations_briefing_leaks_no_blue_information(self) -> None:
+        _, _, ops, _ = _active_projection(IntelPolicy.REALISTIC)
+        blob = fakes.serialise_everything(ops.to_dict(), ops.render_compact())
+        assert fakes.blue_leaks_in(blob) == []
+        # It still names the public front-line base RED is fighting.
+        assert fakes.PUBLIC_BLUE_FRONT_BASE in blob
+
+    def test_the_capability_index_is_red_only_and_leaks_nothing(self) -> None:
+        _, _, _, capabilities = _active_projection(IntelPolicy.REALISTIC)
+        blob = fakes.serialise_everything(
+            capabilities.to_dict(), capabilities.render_compact()
+        )
+        assert fakes.blue_leaks_in(blob) == []
+
+    def test_the_worked_stage_examples_use_only_red_identifiers(self) -> None:
+        # The examples the prompt shows the model are built from the campaign's
+        # own identifiers; a BLUE id slipping into one would be a leak with an
+        # especially high chance of being echoed back.
+        _, _, ops, capabilities = _active_projection(IntelPolicy.REALISTIC)
+        blob = fakes.serialise_everything(
+            example_logistics_json(ops, capabilities),
+            example_air_tasking_json(ops, capabilities),
+        )
+        assert fakes.blue_leaks_in(blob) == []
+
+    def test_an_executed_active_turn_writes_no_blue_sentinel(
+        self, tmp_path: Path
+    ) -> None:
+        # The strongest form of the guarantee: run a real three-stage turn and
+        # scan the audit record it writes to disk, prompts and all.
+        from game.ai_commander.enums import CommanderMode
+
+        campaign, game = fakes.synthetic_game()
+        brief = IntelProjector(game, IntelPolicy.REALISTIC).project()
+        ops = OperationsProjector(game, IntelPolicy.REALISTIC).project(
+            brief.campaign_id_hash, brief.campaign_revision
+        )
+        capabilities = capability_index_for(campaign.red)
+        logistics = example_logistics_json(ops, capabilities)
+        logistics.pop("runway_repairs", None)
+        script = [
+            example_decision_json(brief),
+            json.dumps(logistics),
+            json.dumps(example_air_tasking_json(ops, capabilities)),
+        ]
+
+        import unittest.mock as um
+
+        class _Noop:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                pass
+
+            def price_of(self, x: Any) -> int:
+                return 1
+
+            def can_buy(self, x: Any) -> bool:
+                return True
+
+            def buy(self, *a: Any) -> None:
+                pass
+
+            def plan_mission(self, *a: Any) -> None:
+                return None
+
+        with um.patch("game.purchaseadapter.AircraftPurchaseAdapter", _Noop), um.patch(
+            "game.purchaseadapter.GroundUnitPurchaseAdapter", _Noop
+        ), um.patch("game.commander.packagefulfiller.PackageFulfiller", _Noop):
+            result = RedCommanderTurn(
+                game,
+                fakes.make_config(mode=CommanderMode.ACTIVE, log_prompts=True),
+                audit_log=AuditLog(tmp_path),
+                client=fakes.ScriptedClient(script),
+            ).run()
+
+        assert result.accepted
+        assert result.log_path is not None
+        written = result.log_path.read_text(encoding="utf-8")
+        assert fakes.blue_leaks_in(written) == []
+        assert fakes.red_facts_missing_from(written) == []

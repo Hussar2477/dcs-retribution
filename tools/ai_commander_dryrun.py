@@ -14,7 +14,8 @@ to answer four questions before anyone trusts the feature in a real campaign:
    whole assembled prompt for them.
 3. What does a turn cost? The prompt and a representative response are measured,
    then priced against several candidate models and compared with the per-turn
-   cost cap.
+   cost cap -- for both COMMANDER mode (one call) and ACTIVE mode, whose three
+   sequential stages are run end to end and their per-stage tokens measured.
 4. Does it work against the real provider? With ``OPENROUTER_API_KEY`` set, one
    real call is made. Without a key the harness still runs everything else and
    exits 0.
@@ -58,10 +59,22 @@ from game.ai_commander.decision import (
     decision_json_schema,
     parse_decision,
 )
+from game.ai_commander.activeprompt import (
+    build_stage_messages,
+    build_stage_repair_messages,
+)
+from game.ai_commander.capabilities import CAPABILITY_CACHE, capability_index_for
 from game.ai_commander.enums import (
+    CommanderMode,
     CommanderPersonality,
     FallbackReason,
     IntelPolicy,
+)
+from game.ai_commander.operations import OperationsProjector
+from game.ai_commander.plan import (
+    CommanderStage,
+    example_air_tasking_json,
+    example_logistics_json,
 )
 from game.ai_commander.intel import IntelProjector, RedCommanderBrief
 from game.ai_commander.legality import LegalityChecker
@@ -161,6 +174,11 @@ class ScenarioOutcome:
     actual_cost: float = 0.0
     matched_expectation: bool = False
     notes: list[str] = field(default_factory=list)
+    # ACTIVE mode only: the multi-stage view of the turn.
+    mode: Optional[str] = None
+    stages: Optional[dict[str, str]] = None
+    packages_added: Optional[int] = None
+    orders_applied: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +196,10 @@ class ScenarioOutcome:
             "actual_cost": self.actual_cost,
             "matched_expectation": self.matched_expectation,
             "notes": self.notes,
+            "mode": self.mode,
+            "stages": self.stages,
+            "packages_added": self.packages_added,
+            "orders_applied": self.orders_applied,
         }
 
 
@@ -212,6 +234,103 @@ def install_fake_objective_finder() -> None:
     import game.commander.objectivefinder as module
 
     setattr(module, "ObjectiveFinder", FakeObjectiveFinder)
+
+
+class _NoopAircraftAdapter:
+    """An aircraft purchase adapter that applies orders without a real theater.
+
+    ACTIVE mode's logistics and air-tasking stages execute for real through
+    Retribution's own systems, but the concrete purchase adapters need a
+    fully-built campaign the synthetic one deliberately does not have. These
+    no-ops let the executor run end-to-end while leaving the budget untouched, so
+    the only thing that moves campaign state in a dry run is an explicit runway
+    repair -- exactly as in ``tests.ai_commander.test_active_turn``.
+    """
+
+    def __init__(self, control_point: Any) -> None:
+        self.control_point = control_point
+
+    def price_of(self, squadron: Any) -> int:
+        return int(squadron.aircraft.price)
+
+    def can_buy(self, squadron: Any) -> bool:
+        return True
+
+    def buy(self, squadron: Any, quantity: int) -> None:
+        pass
+
+
+class _NoopGroundAdapter:
+    def __init__(self, control_point: Any, coalition: Any, game: Any) -> None:
+        pass
+
+    def price_of(self, unit_type: Any) -> int:
+        return int(unit_type.price)
+
+    def buy(self, unit_type: Any, quantity: int) -> None:
+        pass
+
+
+class _FakePackage:
+    def __init__(self, mission: Any) -> None:
+        self.mission = mission
+
+
+class _FakeFulfiller:
+    def __init__(
+        self, coalition: Any, theater: Any, flights: Any, settings: Any
+    ) -> None:
+        pass
+
+    def plan_mission(self, mission: Any, count: int, now: Any, tracer: Any) -> Any:
+        return _FakePackage(mission)
+
+
+def install_fake_execution_apis() -> None:
+    """Point ACTIVE-mode execution at no-op adapters instead of a real theater.
+
+    The controller imports these lazily inside :class:`PlanExecutor`, so
+    replacing the attribute on each defining module covers every stage at once.
+    This is the process-wide equivalent of the ``_patch_execution_apis`` fixture
+    the unit tests use. It only affects ACTIVE mode; COMMANDER-mode scenarios
+    never touch these adapters.
+    """
+
+    import game.purchaseadapter as purchase
+    import game.commander.packagefulfiller as fulfiller
+
+    setattr(purchase, "AircraftPurchaseAdapter", _NoopAircraftAdapter)
+    setattr(purchase, "GroundUnitPurchaseAdapter", _NoopGroundAdapter)
+    setattr(fulfiller, "PackageFulfiller", _FakeFulfiller)
+
+
+class MeasuringClient(ScriptedClient):
+    """A scripted client that reports usage measured from the real prompt.
+
+    :class:`ScriptedClient` returns one fixed usage block for every call, which
+    is fine for exercising control flow but useless for measuring what an ACTIVE
+    turn actually costs: its three stages send three differently-sized prompts.
+    This subclass sizes each reply from the exact messages it was handed and the
+    exact scripted response it is about to return, using the same
+    ``pricing.estimate_tokens`` the controller uses. The per-stage token totals
+    read back off the audit record are then measurements of the real ACTIVE
+    prompts, not canned numbers.
+    """
+
+    def complete(
+        self,
+        messages: Any,
+        max_output_tokens: int = 2000,
+        temperature: float = 0.2,
+        response_format: Any = None,
+    ) -> LlmResponse:
+        prompt_text = "\n".join(str(m.get("content", "")) for m in messages)
+        upcoming = self.script[0] if self.script else ""
+        response_text = "" if isinstance(upcoming, BaseException) else str(upcoming)
+        self.usage = _measured_usage(prompt_text, response_text)
+        return super().complete(
+            messages, max_output_tokens, temperature, response_format
+        )
 
 
 def scaled_campaign(front_pairs: int, iads_per_base: int = 3) -> tuple[Any, Any]:
@@ -358,6 +477,93 @@ def _posture_plan(brief: Any, posture: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ACTIVE-mode building blocks
+#
+# ACTIVE mode runs three sequential requests per turn -- commander intent, then
+# logistics, then air tasking -- each with its own schema, validator and
+# legality pass. These helpers build the operations brief and capability index
+# the later stages plan against, and the scripted stage payloads, from the
+# campaign's own identifiers, so a scripted "model" that echoes them is a
+# well-behaved model and any invented identifier is a genuine cheat.
+# ---------------------------------------------------------------------------
+
+
+def _active_context(campaign: Any, game: Any) -> tuple[Any, Any, Any]:
+    """The intel brief, operations brief and capability index for one turn."""
+
+    CAPABILITY_CACHE.clear()
+    brief = _brief_for(game)
+    operations = OperationsProjector(game, IntelPolicy.REALISTIC).project(
+        brief.campaign_id_hash, brief.campaign_revision
+    )
+    capabilities = capability_index_for(campaign.red)
+    return brief, operations, capabilities
+
+
+def _active_stage1(brief: Any) -> str:
+    """Stage 1: a well-formed commander decision (same schema as COMMANDER)."""
+
+    return example_decision_json(brief)
+
+
+def _active_stage2(operations: Any, capabilities: Any, *, spend: bool = False) -> str:
+    """Stage 2: a logistics plan.
+
+    With ``spend=False`` the runway repair and ground purchase are dropped, so
+    the plan changes force posture without debiting the budget -- which keeps the
+    campaign revision fixed and stage 3 legal. With ``spend=True`` the runway
+    repair debits the budget for real, moving the revision under stage 3's feet.
+    """
+
+    plan = example_logistics_json(operations, capabilities)
+    if not spend:
+        plan.pop("runway_repairs", None)
+        plan.pop("ground_orders", None)
+    return json.dumps(plan)
+
+
+def _active_stage3(operations: Any, capabilities: Any) -> str:
+    """Stage 3: a well-formed air tasking order."""
+
+    return json.dumps(example_air_tasking_json(operations, capabilities))
+
+
+def _active_stage3_unlisted_target(operations: Any, capabilities: Any) -> str:
+    """An air tasking order aimed at a target RED was never briefed on.
+
+    The target identifier is invented; the sentinel scan proves it is not in the
+    briefing. The structural validator must refuse the package before it ever
+    reaches legality checking, leaving nothing for RED to strike of its own.
+    """
+
+    plan = example_air_tasking_json(operations, capabilities)
+    first = dict(plan["packages"][0])
+    first["target_id"] = "TGT-BLUE-SECRET-CANARY"
+    plan["packages"] = [first]
+    plan["intent"] = "strike a base RED was never told about"
+    return json.dumps(plan)
+
+
+def _active_stage3_unowned_airframe(operations: Any, capabilities: Any) -> str:
+    """An air tasking order flown by an airframe RED does not operate.
+
+    The target and mission types are legal; only the ``aircraft_id`` is invented
+    (a BLUE-private airframe sentinel). Every flight must be refused as an
+    airframe this faction does not operate, so the package collapses to nothing.
+    """
+
+    plan = example_air_tasking_json(operations, capabilities)
+    first = dict(plan["packages"][0])
+    first["flights"] = [
+        dict(flight, aircraft_id=BLUE_SENTINELS["blue_aircraft_name"])
+        for flight in first["flights"]
+    ]
+    plan["packages"] = [first]
+    plan["intent"] = "fly a strike with an airframe RED does not own"
+    return json.dumps(plan)
+
+
+# ---------------------------------------------------------------------------
 # Scenarios
 # ---------------------------------------------------------------------------
 
@@ -399,6 +605,15 @@ def _run_turn(
     outcome.actual_cost = float(described["actual_cost"])
     if result.directive is not None:
         outcome.directive = result.directive.render_summary()
+    # ACTIVE mode adds the per-stage view; describe_turn_result only includes
+    # these keys when the turn actually ran staged (i.e. in ACTIVE mode).
+    if "mode" in described:
+        outcome.mode = described["mode"]
+        outcome.stages = described.get("stages")
+        if "packages_added" in described:
+            outcome.packages_added = int(described["packages_added"])
+        if "orders_applied" in described:
+            outcome.orders_applied = int(described["orders_applied"])
 
     matched = True
     if expect_accepted is not None and outcome.accepted is not expect_accepted:
@@ -805,6 +1020,301 @@ def scenario_disabled(audit_root: Path) -> ScenarioOutcome:
     return result
 
 
+def _expect_stages(result: ScenarioOutcome, expected: dict[str, str]) -> None:
+    """Fail the scenario unless every named stage ended as expected."""
+
+    actual = result.stages or {}
+    for stage, status in expected.items():
+        if actual.get(stage) != status:
+            result.matched_expectation = False
+            result.notes.append(
+                f"MISMATCH: stage {stage} expected {status}, "
+                f"got {actual.get(stage)!r}"
+            )
+
+
+def scenario_active_valid(audit_root: Path) -> ScenarioOutcome:
+    """ACTIVE: do all three well-formed stages get applied in one turn?"""
+
+    outcome = ScenarioOutcome(
+        name="active-valid",
+        question="ACTIVE: do all three well-formed stages get applied?",
+        expected="accepted; three completions (one per stage); command, "
+        "logistics and air tasking all accepted; RED's own packages added",
+    )
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+    client = ScriptedClient(
+        [
+            _active_stage1(brief),
+            _active_stage2(operations, capabilities),
+            _active_stage3(operations, capabilities),
+        ],
+        catalog=CATALOG_PAYLOAD,
+    )
+    result = _run_turn(
+        outcome,
+        game,
+        make_config(mode=CommanderMode.ACTIVE),
+        client,
+        audit_root,
+        True,
+        None,
+        expect_completions=3,
+    )
+    _expect_stages(
+        result,
+        {"command": "accepted", "logistics": "accepted", "air_tasking": "accepted"},
+    )
+    if result.packages_added != 2:
+        result.matched_expectation = False
+        result.notes.append(
+            f"MISMATCH: expected 2 AI packages, got {result.packages_added}"
+        )
+    result.notes.append(
+        f"orders applied: {result.orders_applied}; packages added: "
+        f"{result.packages_added}"
+    )
+    return result
+
+
+def scenario_active_cheat_target(audit_root: Path) -> ScenarioOutcome:
+    """ACTIVE: can air tasking strike a target RED was never briefed on?"""
+
+    outcome = ScenarioOutcome(
+        name="active-cheat-target",
+        question="ACTIVE: can air tasking strike a target RED was never briefed on?",
+        expected="the invented target is refused; nothing of RED's own is struck, "
+        "so the built-in planner covers air tasking and the turn still stands",
+    )
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+
+    cheat = _active_stage3_unlisted_target(operations, capabilities)
+    leaks = blue_leaks_in(serialise_everything(brief.to_dict(), operations.to_dict()))
+    outcome.notes.append(
+        "sentinel scan of the briefing: "
+        + ("no BLUE-private values present" if not leaks else f"LEAKED {leaks}")
+    )
+    if leaks:
+        outcome.notes.append("MISMATCH: the briefing leaked BLUE-private values")
+
+    client = ScriptedClient(
+        [_active_stage1(brief), _active_stage2(operations, capabilities), cheat],
+        catalog=CATALOG_PAYLOAD,
+    )
+    result = _run_turn(
+        outcome,
+        game,
+        make_config(mode=CommanderMode.ACTIVE),
+        client,
+        audit_root,
+        True,
+        None,
+    )
+    _expect_stages(result, {"command": "accepted", "air_tasking": "accepted"})
+    refused = [r for r in result.rejections if "target_id" in r["element"]]
+    if not refused or result.packages_added:
+        result.matched_expectation = False
+        result.notes.append("MISMATCH: the invented target was not refused cleanly")
+    else:
+        result.notes.append(
+            f"invented target refused ({refused[0]['element']}); AI packages added: "
+            f"{result.packages_added}"
+        )
+    if leaks:
+        result.matched_expectation = False
+    return result
+
+
+def scenario_active_cheat_airframe(audit_root: Path) -> ScenarioOutcome:
+    """ACTIVE: can a package be flown by an airframe RED does not operate?"""
+
+    outcome = ScenarioOutcome(
+        name="active-cheat-airframe",
+        question="ACTIVE: can a package fly an airframe RED does not operate?",
+        expected="every flight on the unowned airframe is refused; the package "
+        "collapses to nothing and the turn still stands",
+    )
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+    client = ScriptedClient(
+        [
+            _active_stage1(brief),
+            _active_stage2(operations, capabilities),
+            _active_stage3_unowned_airframe(operations, capabilities),
+        ],
+        catalog=CATALOG_PAYLOAD,
+    )
+    result = _run_turn(
+        outcome,
+        game,
+        make_config(mode=CommanderMode.ACTIVE),
+        client,
+        audit_root,
+        True,
+        None,
+    )
+    _expect_stages(result, {"command": "accepted", "air_tasking": "accepted"})
+    refused = [r for r in result.rejections if "aircraft_id" in r["element"]]
+    if not refused or result.packages_added:
+        result.matched_expectation = False
+        result.notes.append("MISMATCH: the unowned airframe was not refused cleanly")
+    else:
+        result.notes.append(
+            f"unowned airframe refused ({refused[0]['element']}); AI packages "
+            f"added: {result.packages_added}"
+        )
+    return result
+
+
+def scenario_active_malformed_logistics(audit_root: Path) -> ScenarioOutcome:
+    """ACTIVE: does a broken logistics stage cost only itself?"""
+
+    outcome = ScenarioOutcome(
+        name="active-malformed-logistics",
+        question="ACTIVE: does a broken logistics stage cost only itself?",
+        expected="logistics degrades to the built-in staff after a wasted repair "
+        "call; stage 1's directive stands and stage 3 still runs and is accepted",
+    )
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+    client = ScriptedClient(
+        [
+            _active_stage1(brief),
+            "not json",
+            "still not json",
+            _active_stage3(operations, capabilities),
+        ],
+        catalog=CATALOG_PAYLOAD,
+    )
+    result = _run_turn(
+        outcome,
+        game,
+        make_config(mode=CommanderMode.ACTIVE),
+        client,
+        audit_root,
+        True,
+        None,
+        expect_completions=4,
+    )
+    _expect_stages(
+        result,
+        {
+            "command": "accepted",
+            "logistics": "malformed_response",
+            "air_tasking": "accepted",
+        },
+    )
+    result.notes.append(
+        "logistics fell back to Retribution's built-in procurement; air tasking "
+        f"still added {result.packages_added} package(s)"
+    )
+    return result
+
+
+def scenario_active_tasking_fails(audit_root: Path) -> ScenarioOutcome:
+    """ACTIVE: does a broken stage 3 keep the work stages 1-2 already applied?"""
+
+    outcome = ScenarioOutcome(
+        name="active-tasking-fails",
+        question="ACTIVE: does a broken air-tasking stage undo earlier stages?",
+        expected="air tasking degrades to the built-in mission planner; command "
+        "and logistics stand, no AI packages are added, and the turn is accepted",
+    )
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+    client = ScriptedClient(
+        [
+            _active_stage1(brief),
+            _active_stage2(operations, capabilities),
+            "not json",
+            "still not json",
+        ],
+        catalog=CATALOG_PAYLOAD,
+    )
+    result = _run_turn(
+        outcome,
+        game,
+        make_config(mode=CommanderMode.ACTIVE),
+        client,
+        audit_root,
+        True,
+        None,
+        expect_completions=4,
+    )
+    _expect_stages(
+        result,
+        {
+            "command": "accepted",
+            "logistics": "accepted",
+            "air_tasking": "malformed_response",
+        },
+    )
+    if result.packages_added:
+        result.matched_expectation = False
+        result.notes.append(
+            f"MISMATCH: expected 0 AI packages, got {result.packages_added}"
+        )
+    result.notes.append(
+        "air tasking fell back to the built-in mission planner; earlier stages "
+        "were kept, not rolled back"
+    )
+    return result
+
+
+def scenario_active_cost_cap(audit_root: Path) -> ScenarioOutcome:
+    """ACTIVE: is the cost cap one turn-wide ledger across all three stages?"""
+
+    outcome = ScenarioOutcome(
+        name="active-cost-cap",
+        question="ACTIVE: can the cost cap be exhausted mid-hierarchy?",
+        expected="a cap big enough only for stage 1: command is billed and "
+        "accepted, then logistics and air tasking each hit COST_CAP and degrade "
+        "cleanly -- one call billed, nothing overspent, the turn still stands",
+    )
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+    client = ScriptedClient(
+        [
+            _active_stage1(brief),
+            _active_stage2(operations, capabilities),
+            _active_stage3(operations, capabilities),
+        ],
+        catalog=CATALOG_PAYLOAD,
+    )
+    # 0.012 clears one call at the test catalogue's price but not a second, so the
+    # ledger runs dry after stage 1. See tests.ai_commander.test_active_turn.
+    result = _run_turn(
+        outcome,
+        game,
+        make_config(mode=CommanderMode.ACTIVE, cost_cap_per_turn=0.012),
+        client,
+        audit_root,
+        True,
+        None,
+        expect_completions=1,
+    )
+    _expect_stages(
+        result,
+        {
+            "command": "accepted",
+            "logistics": "cost_cap",
+            "air_tasking": "cost_cap",
+        },
+    )
+    if result.actual_cost > 0.012:
+        result.matched_expectation = False
+        result.notes.append(
+            f"MISMATCH: overspent -- ${result.actual_cost:.6f} > $0.012 cap"
+        )
+    result.notes.append(
+        f"only stage 1 was billed (${result.actual_cost:.6f} of the $0.012 cap); "
+        "stages 2 and 3 were refused before any request was sent"
+    )
+    return result
+
+
 SCENARIOS: dict[str, Callable[[Path], ScenarioOutcome]] = {
     "valid": scenario_valid,
     "repair": scenario_repair,
@@ -821,6 +1331,13 @@ SCENARIOS: dict[str, Callable[[Path], ScenarioOutcome]] = {
     "cost-cap": scenario_cost_cap,
     "not-configured": scenario_not_configured,
     "disabled": scenario_disabled,
+    # ACTIVE mode: three staged requests per turn.
+    "active-valid": scenario_active_valid,
+    "active-cheat-target": scenario_active_cheat_target,
+    "active-cheat-airframe": scenario_active_cheat_airframe,
+    "active-malformed-logistics": scenario_active_malformed_logistics,
+    "active-tasking-fails": scenario_active_tasking_fails,
+    "active-cost-cap": scenario_active_cost_cap,
 }
 
 
@@ -957,6 +1474,15 @@ def report_scenarios(
             f"fallback={outcome.fallback_reason or 'none'} "
             f"completions={outcome.completions}"
         )
+        if outcome.mode == "active" and outcome.stages is not None:
+            stages = ", ".join(
+                f"{stage}={status}" for stage, status in outcome.stages.items()
+            )
+            print(f"        stages    {stages}")
+            print(
+                f"        applied   orders={outcome.orders_applied} "
+                f"packages={outcome.packages_added}"
+            )
         if outcome.directive:
             for line in outcome.directive.splitlines():
                 print(f"        orders    {line}")
@@ -1217,6 +1743,200 @@ def report_costs(brief: RedCommanderBrief) -> bool:
     return True
 
 
+#: An ACTIVE turn makes at most this many chat completions: three stages
+#: (command, logistics, air tasking), each with the initial request plus, only
+#: on a validation failure, exactly one repair. See ``controller._run_active``
+#: and ``controller._run_stage`` -- there is no retry loop beyond the one repair
+#: per stage. The one unbilled ``GET /models`` lookup per turn is not counted.
+ACTIVE_STAGES_PER_TURN = 3
+ACTIVE_MAX_COMPLETIONS_PER_TURN = 6
+
+
+def report_active_costs() -> bool:
+    """Measure and price a full three-stage ACTIVE turn against the cap.
+
+    COMMANDER mode is one request; ACTIVE mode is three sequential requests --
+    command, then logistics, then air tasking -- each with its own prompt that
+    grows as later stages carry a summary of the earlier ones. The single-call
+    figures in ``report_costs`` therefore do not describe an ACTIVE turn, so this
+    measures all three stages of a real, well-formed ACTIVE turn end to end.
+
+    Typical figures come from actually running the turn: a :class:`MeasuringClient`
+    reports usage sized from the exact assembled stage prompts, and the per-stage
+    totals are read straight back off the audit record. Worst-case figures assume
+    every stage needs its one repair and both replies hit the output cap.
+    """
+
+    _rule("COST PER RED TURN -- ACTIVE MODE")
+
+    install_fake_execution_apis()
+    campaign, game = synthetic_game()
+    brief, operations, capabilities = _active_context(campaign, game)
+    config = make_config(mode=CommanderMode.ACTIVE)
+    max_output = config.max_output_tokens
+
+    # -- typical turn: run it and read measured per-stage tokens back ---------
+    client = MeasuringClient(
+        [
+            _active_stage1(brief),
+            _active_stage2(operations, capabilities),
+            _active_stage3(operations, capabilities),
+        ],
+        catalog=CATALOG_PAYLOAD,
+    )
+    with tempfile.TemporaryDirectory(prefix="ai-commander-active-cost-") as tmp:
+        result = RedCommanderTurn(
+            game, config, audit_log=AuditLog(Path(tmp)), client=client
+        ).run()
+        record = result.record
+        stage_rows = (
+            [
+                (
+                    stage.stage,
+                    int(stage.prompt_tokens),
+                    int(stage.completion_tokens),
+                )
+                for stage in record.stages
+            ]
+            if record is not None
+            else []
+        )
+
+    print(
+        "  Method: identical to the COMMANDER measurement above -- there is no\n"
+        "  provider tokeniser in this repo and no new dependency may be added, so\n"
+        "  token counts come from pricing.estimate_tokens() applied to the exact\n"
+        "  assembled stage prompts and scripted replies. The typical row below is\n"
+        "  a real ACTIVE turn that was run just now; its per-stage token counts\n"
+        "  are read straight off the audit record."
+    )
+    print()
+    print(f"  {'stage':<16}{'prompt tok':>12}{'reply tok':>12}")
+    typical_prompt_tokens = 0
+    typical_completion_tokens = 0
+    for stage_name, prompt_tokens, completion_tokens in stage_rows:
+        print(f"  {stage_name:<16}{prompt_tokens:>12}{completion_tokens:>12}")
+        typical_prompt_tokens += prompt_tokens
+        typical_completion_tokens += completion_tokens
+    print(
+        f"  {'turn total':<16}{typical_prompt_tokens:>12}"
+        f"{typical_completion_tokens:>12}"
+    )
+
+    # -- worst case: every stage needs its one repair, replies hit the cap ----
+    prior = "\n".join(
+        [
+            "Commander intent applied this turn.",
+            "Logistics orders applied this turn:",
+            "  (representative prior-stage summary carried into the prompt)",
+        ]
+    )
+    worst_prompt_tokens = 0
+    stage_specs = (
+        (CommanderStage.COMMAND, None),
+        (CommanderStage.LOGISTICS, prior),
+        (CommanderStage.AIR_TASKING, prior),
+    )
+    for stage, prior_summary in stage_specs:
+        initial = "\n".join(
+            m["content"]
+            for m in build_stage_messages(
+                stage,
+                brief,
+                operations,
+                capabilities,
+                config.personality,
+                prior_summary,
+            )
+        )
+        repair = "\n".join(
+            m["content"]
+            for m in build_stage_repair_messages(
+                stage,
+                brief,
+                operations,
+                capabilities,
+                config.personality,
+                "not JSON",
+                "the previous response failed validation",
+                prior_summary,
+            )
+        )
+        worst_prompt_tokens += estimate_tokens(initial) + estimate_tokens(repair)
+    worst_completion_tokens = ACTIVE_MAX_COMPLETIONS_PER_TURN * max_output
+
+    print()
+    print(
+        f"  typical turn    = {ACTIVE_STAGES_PER_TURN} calls: "
+        f"{typical_prompt_tokens} in + {typical_completion_tokens} out"
+    )
+    print(
+        f"  worst-case turn = {ACTIVE_MAX_COMPLETIONS_PER_TURN} calls: "
+        f"{worst_prompt_tokens} in + {worst_completion_tokens} out "
+        f"(every stage repaired once, all {ACTIVE_MAX_COMPLETIONS_PER_TURN} "
+        f"replies at the {max_output}-token cap)"
+    )
+    print()
+    header = (
+        f"  {'model':<34}{'$/M in':>8}{'$/M out':>9}"
+        f"{'typical':>11}{'worst':>10}  note"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    worst_costs: list[tuple[str, float]] = []
+    for model_id, input_price, output_price, note in CANDIDATE_MODELS:
+        price = ModelPrice(
+            model_id=model_id,
+            input_per_million=input_price,
+            output_per_million=output_price,
+        )
+        typical = price.cost_for(typical_prompt_tokens, typical_completion_tokens)
+        worst = price.cost_for(worst_prompt_tokens, worst_completion_tokens)
+        worst_costs.append((model_id, worst))
+        print(
+            f"  {model_id:<34}{input_price:>8.2f}{output_price:>9.2f}"
+            f"{typical:>11.5f}{worst:>10.5f}  {note}"
+        )
+
+    print()
+    print(f"  Ceiling asked for: ${COST_CEILING_PER_TURN:.2f} per RED turn.")
+    over = [
+        model_id for model_id, worst in worst_costs if worst > COST_CEILING_PER_TURN
+    ]
+    for model_id, worst in worst_costs:
+        headroom = COST_CEILING_PER_TURN / worst if worst > 0 else float("inf")
+        verdict = "OVER" if worst > COST_CEILING_PER_TURN else "under"
+        print(
+            f"    {model_id:<34}worst ${worst:.5f}  {verdict} the cap "
+            f"({headroom:.0f}x headroom)"
+        )
+    if over:
+        print(
+            "  VERDICT: an ACTIVE turn is three to six calls, so it costs several\n"
+            "  times a COMMANDER turn, yet every surveyed model still stays under\n"
+            f"  the ceiling except {', '.join(over)}. The shipped default\n"
+            f"  ({CANDIDATE_MODELS[0][0]}) is far under it. The turn-wide cost cap\n"
+            "  is enforced across all three stages, so a turn can never exceed it\n"
+            "  regardless of model."
+        )
+    else:
+        print(
+            "  VERDICT: an ACTIVE turn is three to six calls, so it costs several\n"
+            "  times a COMMANDER turn, yet every surveyed model's worst-case turn\n"
+            "  still stays under the ceiling, including the pessimistic fallback\n"
+            f"  price. The shipped default is {CANDIDATE_MODELS[0][0]}. The\n"
+            "  turn-wide cost cap is enforced across all three stages, so a turn\n"
+            "  can never exceed it regardless of model."
+        )
+    print(
+        "  These are estimates from measured character counts and published\n"
+        "  prices, not observed invoices. Prices were recorded on 2026-08-05 and\n"
+        "  change without notice; the controller always prices from the live\n"
+        "  /models catalogue at runtime and enforces the cap against it."
+    )
+    return True
+
+
 def report_live_call(model: Optional[str], strict: bool) -> bool:
     _rule("LIVE PROVIDER CALL")
     store = SecretStore()
@@ -1379,6 +2099,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     install_fake_objective_finder()
+    install_fake_execution_apis()
 
     try:
         campaign, game = synthetic_game()
@@ -1388,6 +2109,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         outcomes = report_scenarios(names, audit_root, args.verbose)
         report_audit_trail(audit_root)
         costs_ok = report_costs(brief)
+        active_costs_ok = report_active_costs()
         live_ok = (
             True
             if args.no_live
@@ -1405,6 +2127,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"  intel fairness         {'PASS' if fairness_ok else 'FAIL'}")
         print(f"  cost report            {'produced' if costs_ok else 'failed'}")
         print(
+            "  active cost report     " + ("produced" if active_costs_ok else "failed")
+        )
+        print(
             "  not covered here       anything that needs DCS itself: mission\n"
             "                         generation, the Qt windows, save/load of a\n"
             "                         real campaign, and real provider invoices"
@@ -1421,7 +2146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print(f"  machine-readable results written to {args.json}")
 
-        ok = not failed and fairness_ok and costs_ok and live_ok
+        ok = not failed and fairness_ok and costs_ok and active_costs_ok and live_ok
         print()
         print("RESULT: " + ("all offline checks passed" if ok else "CHECKS FAILED"))
         return 0 if ok else 1

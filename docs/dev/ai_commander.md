@@ -44,6 +44,31 @@ Concretely, the accepted decision is turned into a `CommanderDirective`
 If any of this is unavailable, refused, or fails, the built-in RED automation
 takes the turn instead and the campaign continues normally.
 
+### Two modes: COMMANDER and ACTIVE
+
+The feature ships in two modes, selected by `ai_commander_mode`
+(`CommanderMode` in `enums.py`):
+
+| Mode | Requests/turn | What the model decides | Default |
+| --- | --- | --- | --- |
+| `commander` | 1 | Strategy only: the single ranked directive described above. | ✅ |
+| `active` | up to 3 (6 worst case) | Everything COMMANDER decides, **plus** logistics (what to buy, repair, relocate, retask, transfer) and air tasking (which briefed targets to strike, with which owned airframes), applied through Retribution's own systems. | |
+
+Everything in sections 1 to 4 above is the COMMANDER contract and it holds in
+both modes unchanged. ACTIVE mode is strictly additive: it keeps the same
+strategy stage, then runs two further stages that make *concrete, still
+player-legal* orders. It never widens what the model may touch beyond what a
+human RED player could do from the same UI, it never sees more than the
+COMMANDER brief plus RED's own capability and operations views (section 5.5),
+and every order is re-checked against live state and executed only through
+existing game APIs (section 4.5). If any single stage produces nothing usable,
+that stage — and only that stage — falls back to the built-in staff; the turn
+never breaks (section 3.5).
+
+The rest of this document describes the COMMANDER path first (sections 2–4),
+then the ACTIVE additions in the numbered subsections `x.5`. Choosing between the
+modes is covered in section 7.
+
 ## 2. Module map
 
 All of it lives in `game/ai_commander/`, plus one call site and the UI.
@@ -61,17 +86,30 @@ All of it lives in `game/ai_commander/`, plus one call site and the UI.
 | `llmclient.py` | The only networking code. Stdlib `urllib` only. Timeouts, bounded retries, usage parsing, redacting `__repr__`. |
 | `prompt.py` | System prompt, personality text, user prompt, repair prompt, and the `response_format` request. |
 | `execution.py` | The deterministic adapters listed above. |
-| `audit.py` | `AiDecisionRecord` and `AuditLog` — the on-disk decision log. |
+| `audit.py` | `AiDecisionRecord` and `AuditLog` — the on-disk decision log. `StageRecord` and record schema `red-commander-audit/2` add the per-stage view for ACTIVE turns; v1 records still read. |
 | `secretstore.py` | Where the API key lives, and how it is masked. |
-| `config.py` | `AiCommanderConfig`, built from `Settings` plus the secret store. |
-| `controller.py` | `RedCommanderTurn` — orchestrates one turn. Never raises. |
+| `config.py` | `AiCommanderConfig`, built from `Settings` plus the secret store. Carries `mode`; `requests_per_turn` is 1 (COMMANDER) or 3 (ACTIVE). |
+| `controller.py` | `RedCommanderTurn` — orchestrates one turn. Never raises. `_run_commander` is the one-call path; `_run_active` is the three-stage path. |
+
+ACTIVE mode adds these modules (all RED-only, all off the same fairness
+boundary), used only when `ai_commander_mode` is `active`:
+
+| Module | Responsibility |
+| --- | --- |
+| `capabilities.py` | `CapabilityIndex` — the RED-only catalogue of airframes, ground units, ships and doctrine RED **owns or can buy**, built straight from game data. It is what lets the model name a concrete airframe or unit without training-data guessing or reading BLUE's roster. `CAPABILITY_CACHE` memoises it per faction signature. |
+| `operations.py` | `OperationsProjector` / `OperationsBrief` — RED's own bases, squadrons and *observable* targets, with generic `BASE-N` / `SQN-N` / `TGT-N` ids and never a coordinate. `OperationsResolver` maps those ids back to live objects for legality and execution. |
+| `plan.py` | The `LOGISTICS` and `AIR_TASKING` JSON schemas, their order dataclasses, `validate_logistics_plan` / `validate_air_tasking_plan` (structural validation against the brief), and `CommanderStage`. |
+| `activeprompt.py` | The per-stage system/user/repair prompts and `response_format`, assembled from the capability index, the operations brief and a summary of the prior stages. |
+| `planlegality.py` | `PlanLegalityChecker` — the ACTIVE analogue of `legality.py`. Re-checks every schema-valid order against live state (budget across the stage, parking, supply source, transit route, runway eligibility, airframe ownership, revision) and returns `ExecutableLogistics` / `ExecutableAirTasking` plus `Rejection`s. |
+| `planexecution.py` | `PlanExecutor` — applies the bound, legal orders through Retribution's own APIs only (`AircraftPurchaseAdapter`, `GroundUnitPurchaseAdapter`, `begin_runway_repair`, `plan_relocation`, `set_auto_assignable_mission_types`, `TransferOrder`, `PackageFulfiller`). One order's failure is caught and recorded; it never aborts the turn. |
 
 Outside the package:
 
 * `game/coalition.py` — the single call site, on the RED coalition's turn.
-* `game/settings/settings.py` — ten `ai_commander_*` options on a new
+* `game/settings/settings.py` — the `ai_commander_*` options on a new
   "AI Opponent" settings page (`AI_OPPONENT_PAGE`), split into an
-  "LLM Commander" and a "Fairness and Audit" section.
+  "LLM Commander" and a "Fairness and Audit" section. `ai_commander_mode`
+  chooses COMMANDER (default) or ACTIVE.
 * `game/settings/textoption.py` — a new free-text option kind, needed for the
   model identifier and base URL.
 * `qt_ui/windows/settings/aicommanderkey.py` — the API key widget. Writes to the
@@ -136,6 +174,57 @@ malformed output lands on the same deterministic fallback. The list of reasons
 is the `FallbackReason` enum: `DISABLED`, `NOT_CONFIGURED`, `COST_CAP`,
 `TRANSPORT_ERROR`, `HTTP_ERROR`, `TIMEOUT`, `MALFORMED_RESPONSE`,
 `STALE_RESPONSE`, `NO_LEGAL_CONTENT`, `UNEXPECTED_ERROR`.
+
+### 3.5 ACTIVE mode: the three-stage turn
+
+When `ai_commander_mode` is `active`, `run()` dispatches to `_run_active`
+instead of `_run_commander`. Steps 1–6 above are identical — same disabled
+check, same brief, same replay guard, same usability check, same catalogue
+lookup, and **the same single `CostLedger` seeded once for the whole turn**.
+What changes is that the turn now asks three questions in sequence, each its own
+request with its own schema, validator, legality pass and audit `StageRecord`:
+
+1. **Operations projection.** Before stage 1, `_run_active` projects the two
+   RED-only views the later stages plan against: the `OperationsBrief`
+   (`OperationsProjector`) and the `CapabilityIndex` (`capability_index_for`).
+   If either projection raises, the whole turn degrades to COMMANDER mode for
+   that turn (`self._run_commander(...)`) with a note — it never breaks.
+2. **Stage 1 — command intent.** `_active_command_stage` runs the exact
+   COMMANDER decision (same schema, same validator, same `LegalityChecker`,
+   section 4) and produces the same `CommanderDirective`. If stage 1 yields
+   nothing legal, the *entire* turn falls back to the built-in RED automation,
+   exactly as a COMMANDER turn would — the later stages are not attempted.
+3. **Stage 2 — logistics.** `_active_logistics_stage` asks for a `LogisticsPlan`
+   (aircraft buys, ground-unit buys, runway repairs, squadron relocations,
+   re-taskings, ground transfers), validates it structurally against the brief
+   (`validate_logistics_plan`), then re-checks every surviving order against
+   live state with `PlanLegalityChecker.check_logistics`. What survives becomes
+   an `ExecutableLogistics` and is applied immediately through `PlanExecutor`
+   (real game APIs, section 4.5). An empty-but-well-formed plan is *accepted*
+   (the commander legitimately ordered no logistics this turn); a plan that
+   produced nothing legal, or a stale one, degrades **this stage only**.
+4. **Stage 3 — air tasking.** `_active_air_tasking_stage` asks for an
+   `AirTaskingPlan` (packages of flights against briefed targets), validates it
+   structurally, re-checks each package and flight with
+   `PlanLegalityChecker.check_air_tasking` (target resolves to a briefed TGO,
+   airframe is one RED operates, mission is one that airframe can fly), and
+   applies the survivors with `PlanExecutor.execute_air_tasking`, which builds
+   real packages via `PackageFulfiller` and adds them to RED's ATO.
+5. **Accept.** `record.execution_report` captures what was applied and what
+   failed, and the turn is accepted carrying the stage-1 directive plus the
+   execution report.
+
+**Per-stage degradation is the core robustness property.** Each stage gets the
+same "initial request plus at most one repair" treatment as a COMMANDER turn
+(step 9 above), and the single turn-wide ledger is checked before *every*
+request, so the three stages together can never spend more than one cost cap. A
+stage that fails — malformed twice, no legal content, stale, or refused by the
+cap — is marked degraded with its `FallbackReason` and Retribution's built-in
+staff covers that domain for the turn, while every stage that already succeeded
+stays applied. Only a stage-1 failure loses the whole turn; a stage-2 or stage-3
+failure never undoes an earlier stage and never breaks the turn. This is what
+`tests/ai_commander/test_active_turn.py` and the `active-*` dry-run scenarios
+exercise end to end.
 
 ## 4. Fairness and anti-cheat guarantees
 
@@ -207,6 +296,52 @@ as a format string. Tool calls are refused in v1: if a response arrives with
 still written exclusively by Retribution's own persistence code from its own
 objects.
 
+### 4.5 ACTIVE mode keeps every guarantee, one legality rule per action
+
+ACTIVE mode makes *concrete* orders, so it is where "player-equivalent" has to
+be proven, not asserted. The rule is simple: **the model may order only what a
+human RED player could do from the same screens, and every order is re-checked
+against live state and carried out through the same game code the player's UI
+calls.** The four guarantees above hold unchanged, and stage 2/3 add a fifth:
+no order reaches the game except through `PlanExecutor`, which calls Retribution's
+own APIs and never mutates state directly.
+
+Each new action class is a player action with its own legality rule in
+`PlanLegalityChecker` and its own executor in `PlanExecutor`:
+
+| Action class (stage) | The player equivalent | Legality re-check against live state | Executed through |
+| --- | --- | --- | --- |
+| Aircraft purchase (2) | Buy aircraft into a squadron | Airframe is in the capability index; squadron exists and can base there; cumulative stage spend ≤ budget; parking available | `AircraftPurchaseAdapter.buy` |
+| Ground-unit purchase (2) | Buy front-line ground units | Unit type in the index; a base with a supply source; cumulative spend ≤ budget | `GroundUnitPurchaseAdapter.buy` |
+| Runway repair (2) | Repair a damaged runway | Base is RED's, runway actually damaged and repairable, repair cost ≤ budget | `ControlPoint.begin_runway_repair` + `adjust_budget` |
+| Squadron relocation (2) | Move a squadron between bases | Destination is RED's, can operate the type, has parking | `Squadron.plan_relocation` / `cancel_relocation` |
+| Squadron re-tasking (2) | Set a squadron's auto-assignable missions | Squadron is capable of each task requested | `Squadron.set_auto_assignable_mission_types` |
+| Ground transfer (2) | Move ground units between bases | Units actually present at origin; a transit route exists via `coalition.transfers.network_for()` | `TransferOrder` + `coalition.transfers.new_transfer` |
+| Air package + flights (3) | Plan a package against a target | Target resolves to a **briefed** TGO; airframe is one RED operates; mission is one that airframe can fly; package survives structural checks | `PackageFulfiller.plan_mission` + `coalition.ato.add_package` |
+
+Two anti-cheat consequences are worth spelling out because the tests and the
+dry run both prove them:
+
+* **Invented targets collapse to nothing.** A package aimed at a target id that
+  is not in the operations brief (the `active-cheat-target` scenario uses the
+  sentinel `TGT-BLUE-SECRET-CANARY`) is dropped by structural validation before
+  legality ever runs. The rejection is recorded (`packages[0].target_id:
+  target identifier is not in the brief`), the stage is *accepted* with an empty
+  air-tasking order, no package is added, and the built-in planner covers air
+  tasking. The model cannot strike something it was never briefed on.
+* **Unowned airframes collapse to nothing.** Flights flown by an airframe RED
+  does not operate (the `active-cheat-airframe` scenario uses a BLUE-private
+  airframe sentinel) are each refused (`packages[...].flights[...].aircraft_id:
+  airframe is not one this faction operates`) and the package collapses. RED can
+  only ever fly airframes in its own capability index.
+
+Because the capability index and operations brief are built from **RED's own
+coalition only** — `CapabilityIndexBuilder` reads RED's owned and buyable units
+and never touches `coalition.opponent` or `game.blue`, and `OperationsProjector`
+projects only RED-owned control points and *observable* targets — the model is
+never even shown a BLUE unit type, squadron or hidden base to name. The
+intel-leak sentinels in section 5 cover the operations brief too.
+
 ## 5. What `REALISTIC` withholds versus `FULL_PARITY`
 
 Two intel policies are selectable in the settings UI
@@ -262,6 +397,47 @@ package name, unit counts, capacity, an undetected TGO and a base placed far
 outside RED's observation range) and then recursively scanning the fully
 serialised brief for any of them. They also assert that RED's *own* equivalents
 **are** present, so the filter cannot pass by being trivially empty.
+
+### 5.5 The capability index and operations brief (ACTIVE mode)
+
+COMMANDER mode ranks abstractions, so the intel brief is all it needs. ACTIVE
+mode names concrete airframes, units, bases and targets, so it is given two more
+RED-only views — and both are anti-cheat mechanisms, not just conveniences.
+
+**Capability index (`capabilities.py`).** A catalogue of every airframe, ground
+unit, ship and doctrine value **RED already owns or is allowed to buy**, built
+by `CapabilityIndexBuilder` straight from RED's faction and coalition data. Each
+entry carries the facts the model needs to plan — price, the mission roles the
+airframe is `capable_of`, year introduced, a few combat characteristics — and
+nothing else. It exists for two reasons:
+
+* *Anti-hallucination.* Without it, a model would name airframes and units from
+  its training data ("send the Su-57s") that this faction may not field in this
+  era. The index is the closed vocabulary of buyable/ownable things, so
+  `validate_logistics_plan` / `validate_air_tasking_plan` can reject anything
+  outside it as a structural error before legality even runs.
+* *Anti-cheat.* It is built from RED's side only — it never reads
+  `coalition.opponent` or `game.blue` — so the model is physically never shown a
+  BLUE airframe or unit type to copy. That is what makes the
+  `active-cheat-airframe` refusal a structural certainty, not a filter that
+  might be forgotten.
+
+It is derived from live data every turn (memoised in `CAPABILITY_CACHE` by a
+`sha256` of the faction's unit data, so an unchanged faction is not rebuilt), and
+its `content_hash()` is recorded in the audit log so a reader can tell which
+catalogue a turn planned against.
+
+**Operations brief (`operations.py`).** RED's own operational picture: its
+bases, its squadrons, and the targets it can *observe*, each with a generic
+`BASE-N` / `SQN-N` / `TGT-N` identifier and never a coordinate (a target's
+location is given only as `near=BASE-n`). It runs through the same
+`IntelPolicy` and observability filter as the intel brief, so it withholds the
+same BLUE-private fields (section 5) and only surfaces targets inside
+`OBSERVATION_RANGE_METERS`. The generic ids are the plan vocabulary: the model
+plans in `TGT-2` / `SQN-1`, and `OperationsResolver` maps those back to the live
+game objects for legality checking and execution, so the model never handles a
+real object, a save reference or a coordinate. Its `content_hash()` is recorded
+too.
 
 ## 6. Auditing a turn
 
@@ -499,6 +675,49 @@ observed invoices. Prices were recorded on 2026-08-05 and change without notice;
 the controller always prices from the live `/models` catalogue at runtime and
 records the price it used in the audit record.
 
+### 8.1 ACTIVE mode: three stages, up to six calls
+
+ACTIVE mode replaces the single strategic decision with **three sequential
+stages per RED turn** — `command`, `logistics`, `air_tasking`. Each stage is one
+billed completion; each may be repaired once, so the hard ceiling is **six
+billed completions per turn** (three initial + three repairs). The stages share
+one `CostLedger` seeded from `audit_log.spent_this_turn`, so the cap is applied
+across the whole turn, not per stage — a stage is refused before sending if its
+worst-case reserve would push the turn total past the cap.
+
+The figures below are exact measurements from
+`tools/ai_commander_dryrun.py --scenario active-valid`, which assembles and
+prices the three real stage prompts against the synthetic campaign. Each later
+stage carries a short summary of the prior stages, so `logistics` and
+`air_tasking` prompts are slightly larger than `command`.
+
+| Stage | Est. tokens in | Est. tokens out |
+| --- | ---: | ---: |
+| `command` | 2688 | 183 |
+| `logistics` | 3225 | 70 |
+| `air_tasking` | 2965 | 143 |
+| **turn total (3 calls, no repair)** | **8878** | **396** |
+
+* typical turn = 3 calls: 8878 in + 396 out
+* worst-case turn = 6 calls: 17761 in + 12000 out (every stage repaired once, all six replies at the 2000-token cap)
+
+| Model | $/M in | $/M out | Typical turn | Worst-case turn | Headroom vs $0.50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `deepseek/deepseek-v4-flash-0731` (shipped default) | 0.09 | 0.18 | $0.00087 | $0.00376 | 133x |
+| `qwen/qwen3.7-flash` (cheapest surveyed) | 0.03 | 0.13 | $0.00032 | $0.00209 | 239x |
+| `openai/gpt-5.6-luna` | 0.10 | 0.60 | $0.00113 | $0.00898 | 56x |
+| `z-ai/glm-5.2` | 0.76 | 2.42 | $0.00771 | $0.04254 | 12x |
+| `moonshotai/kimi-k3` | 3.00 | 15.00 | $0.03257 | $0.23328 | 2x |
+| catalogue unavailable (built-in pessimistic price) | 3.00 | 15.00 | $0.03257 | $0.23328 | 2x |
+
+**Verdict: even in ACTIVE mode, with all three stages repaired and every reply
+at the token cap, every surveyed model's worst-case turn stays under the $0.50
+ceiling** — including the pessimistic fallback price used when the catalogue
+cannot be read, which lands at roughly $0.23, a little over 2x headroom. The
+shipped default keeps two orders of magnitude of margin. ACTIVE mode costs
+roughly four times a COMMANDER turn because it makes three to six calls instead
+of one to two, and the cap absorbs that comfortably.
+
 ## 9. Tests and the dry-run harness
 
 ### Unit tests
@@ -516,6 +735,17 @@ campaign entirely out of stubs — no DCS, no mission files, no network:
 | `test_cost_cap.py` | Ledger arithmetic, refusal before sending when the worst-case reserve exceeds the cap, reserve/release/settle, and that the controller falls back instead of raising. |
 | `test_fallback.py` | Transport error, HTTP error, timeout, repeatedly malformed output, unexpected exception — every one ends in the deterministic fallback so a turn never breaks. |
 | `test_secrets_and_audit.py` | Key masking and redaction, that the key is absent from configs/records/reprs, audit record shape, per-turn cost accounting, and the replay guard. |
+
+The ACTIVE-mode suite adds:
+
+| File | Covers |
+| --- | --- |
+| `test_capabilities.py` | The capability index: only airframes this faction actually operates are listed, only reachable/owned bases and fronts appear, procurement options match the faction, and BLUE capabilities never leak in. Index correctness is what makes an ACTIVE order legal-or-not decidable. |
+| `test_operations_brief.py` | The richer ACTIVE brief. Same `REALISTIC` fairness boundary as `test_intel_leak.py` but for the extra ACTIVE fields, plus per-stage intel-leak sentinels — no BLUE budget, inventory, squadron or base detail in any stage prompt. |
+| `test_active_plan.py` | The ACTIVE decision schema for all three stages: malformed/empty/prose-wrapped JSON, wrong `schema_version`/`turn_id`, unknown/duplicate IDs, unknown enums, unexpected keys, list-length caps, per-stage shape. |
+| `test_active_legality.py` | One legality rule per new action class — packages, procurement, runway repair, aircraft transfer, relocation, posture — each illegal case rejected *with a logged reason*: targets/airframes/bases not in the brief, aircraft the faction does not operate, unreachable or unowned bases, and stale revisions. |
+| `test_active_execution.py` | The execution adapters translate an accepted directive into existing planner inputs (package fulfilment, procurement, runway repair, transfer, relocation) and never mutate state directly; a rejected order produces no side effect. |
+| `test_active_turn.py` | The full three-stage turn: multi-call cost accounting across one shared ledger, per-stage fallback (any stage failing falls back deterministically without breaking the turn), and the cap refusing a later stage when the turn budget is exhausted. |
 
 ### CLI dry-run harness
 
@@ -540,14 +770,32 @@ measurements and the cost table in section 8; and a summary. The scenarios are
 `transport-failure`, `timeout`, `catalogue-unavailable`, `cost-cap`,
 `not-configured`, `disabled`.
 
+ACTIVE mode adds six three-stage scenarios: `active-valid` (a clean
+command/logistics/air-tasking turn), `active-cheat-target` (an air-tasking order
+against a target not in the brief is rejected), `active-cheat-airframe`
+(procurement of an airframe the faction does not operate is rejected),
+`active-malformed-logistics` (one stage returns junk, is repaired, the turn
+continues), `active-tasking-fails` (air tasking stays malformed and falls back
+without breaking the turn), and `active-cost-cap` (a tight cap refuses the later
+stages once the turn budget is spent).
+
 Each scenario asserts an expected outcome, so the harness doubles as an
-integration smoke test. If `OPENROUTER_API_KEY` is set it will additionally make
+integration smoke test. When run with no arguments it also prints a measured
+ACTIVE-mode per-stage token and per-turn cost table against the $0.50 cap
+(section 8.1). If `OPENROUTER_API_KEY` is set it will additionally make
 **one** real request to confirm the provider path end to end; without a key it
 says so and skips it. The key is never printed — only whether one was found.
 
 ## 10. Deferred scope
 
-Deliberately **not** in this version:
+ACTIVE mode delivers part of what the original COMMANDER version deferred: the
+granular role now exists for **air tasking and logistics**. In ACTIVE mode the
+model shapes individual strike/CAP/CAS/DEAD packages (which targets, which
+airframes, which base) and directs the turn's procurement, runway repair,
+aircraft transfers and squadron relocation — all through the same fairness,
+legality, cost and audit machinery as COMMANDER mode.
+
+The following are still deliberately **not** in this version:
 
 * **Naval warfare.** Enemy shipping appears as a target *class* the commander can
   rank, but there is no naval-specific decision, no carrier group tasking and no
@@ -556,19 +804,23 @@ Deliberately **not** in this version:
   air-wing composition.
 * **Transports and cargo logistics.** Convoys and cargo ships are visible as
   target classes; RED's own transport, cargo and airlift planning is untouched
-  and stays with the existing deterministic code.
+  and stays with the existing deterministic code. ACTIVE-mode logistics covers
+  procurement, runway repair, transfer and relocation only.
 * **BLUE as an AI commander.** The hook in `game/coalition.py` fires only for
   RED. Nothing in the package assumes RED, but running it for BLUE would need a
   fairness review of its own (the player's own information would become the
   model's), a second cost budget, and UI work.
-* **A granular "active" role.** The commander decides once per turn at the
-  strategic level. It does not shape individual packages, flight plans or
-  target assignments.
+* **Flight-plan and real-time detail.** Even in ACTIVE mode the model chooses the
+  package's target, airframe and base; it does not author individual waypoints,
+  formations, timing or in-mission unit control. Flight planning stays with the
+  existing deterministic planner.
 
-### How the interfaces are shaped to accept the active role later
+### How the interfaces were shaped to grow into the active role
 
-The v1 boundary is *authority*, not *granularity*, and the seams were left where
-a later active role would need them:
+The v1 COMMANDER boundary was *authority*, not *granularity*, and the seams were
+left where the active role would need them. ACTIVE mode was built into exactly
+those seams — which is why it needed no change to the fairness filter, the cost
+cap semantics or the audit record format:
 
 * **The brief is the only input.** A finer role adds fields to
   `RedCommanderBrief` and entries to `withheld_fields`; it does not change what
@@ -613,6 +865,18 @@ Retribution build are Windows-only, so the following is written and reviewed but
 * Qt rendering of the new settings page, the key widget and the AI Log window,
 * save/load round-tripping of a campaign created with the new settings present,
 * real provider latency, real invoices and real `usage` blocks from OpenRouter.
+
+ACTIVE mode adds these to the list. The stages, schema, legality, cost
+accounting and fallback are all exercised headlessly, but the *execution
+adapters* are driven against no-op fakes in the dry-run harness
+(`_NoopAircraftAdapter`, `_NoopGroundAdapter`, `_FakeFulfiller`), so what remains
+unexercised is the adapters applied to a **real theater**:
+
+* an accepted air-tasking directive actually fulfilled by the real
+  `PackageFulfiller` into flyable packages on a live campaign,
+* directed procurement actually spending against RED's real purchase adapter,
+* runway repair, aircraft transfer and squadron relocation actually applied to a
+  real campaign save and surviving a save/load round-trip.
 
 Everything in sections 3 to 9 is covered by the headless tests and the dry-run
 harness, which do not need DCS.
