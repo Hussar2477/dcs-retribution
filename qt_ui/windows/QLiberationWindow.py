@@ -174,7 +174,7 @@ class QLiberationWindow(QMainWindow):
         self.saveAsAction.triggered.connect(self.saveGameAs)
         self.saveAsAction.setShortcut("CTRL+A")
 
-        self.showAboutDialogAction = QAction("&About dcs-retributionAI", self)
+        self.showAboutDialogAction = QAction("&About DCS Retribution", self)
         self.showAboutDialogAction.setIcon(QIcon.fromTheme("help-about"))
         self.showAboutDialogAction.triggered.connect(self.showAboutDialog)
 
@@ -434,11 +434,11 @@ class QLiberationWindow(QMainWindow):
 
     def updateWindowTitle(self, save_path: Optional[str] = None) -> None:
         """
-        Window title format: dcs-retributionAI - vX.X.X - campaign_name - file_name
+        Window title format: DCS Retribution - vX.X.X - campaign_name - file_name
         Campaign name is shown if a game is loaded and has a campaign_name.
         File name is appended only if save_path is provided.
         """
-        window_title = f"dcs-retributionAI - v{VERSION}"
+        window_title = f"DCS Retribution - v{VERSION}"
 
         if self.game and self.game.campaign_name:
             window_title += f" - {self.game.campaign_name}"
@@ -591,7 +591,7 @@ class QLiberationWindow(QMainWindow):
             "StillClock1",
         ]
         text = (
-            "<h3>dcs-retributionAI " + VERSION + "</h3>" + "<b>Source code : </b>"
+            "<h3>DCS Retribution " + VERSION + "</h3>" + "<b>Source code : </b>"
             "<a href='https://github.com/dcs-retribution/dcs-retribution' style='color:white'>"
             "https://github.com/dcs-retribution/dcs-retribution </a>"
             + "<h4>Authors</h4>"
@@ -618,7 +618,7 @@ class QLiberationWindow(QMainWindow):
             "[https://www.facebook.com/AndriyDankovych]</a>"
         )
         about = QMessageBox()
-        about.setWindowTitle("About dcs-retributionAI")
+        about.setWindowTitle("About DCS Retribution")
         about.setIcon(QMessageBox.Icon.Information)
         about.setText(text)
         logging.info(about.textFormat())
