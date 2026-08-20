@@ -27,7 +27,7 @@ class QLiberationFirstStartWindow(QDialog):
         self.preferences = QLiberationPreferences()
 
         WARN_TEXT = """
-        <strong>Welcome to DCS Retribution !</strong>
+        <strong>Welcome to dcs-retributionAI !</strong>
         <br/><br>
         <strong>Please take 30 seconds to read this :</strong>
         
