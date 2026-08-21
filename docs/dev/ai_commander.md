@@ -569,6 +569,19 @@ tokens, and does not enable any provider plugins. HTTP 429 and 5xx get a small
 bounded backoff; 401 and 402 do not retry — they fall back immediately, since a
 bad key or an empty balance will not fix itself within a turn.
 
+**Reasoning models are supported.** Reasoning models (e.g. the shipped
+`deepseek/deepseek-v4-flash-0731`) emit their thinking into a separate channel
+before the visible answer. When `content` comes back empty, the client falls
+back to reading the reasoning channel (`reasoning_content`, then `reasoning`,
+each in plain-string or content-parts form) so the JSON answer is still
+recovered — this is why the previous empty-`content` `malformed_response`
+fallbacks no longer occur. As defence in depth, on structured decision calls
+(those that carry a `response_format`) the client also passes OpenRouter's
+`reasoning.max_tokens` control, capped at `min(2000, max_output_tokens // 2)`,
+so the model always leaves budget for the actual answer instead of spending it
+all on hidden reasoning. The field is ignored by providers that do not
+understand it (plain OpenAI, Ollama), so it is a safe no-op there.
+
 ### Local models (Ollama and friends)
 
 Any OpenAI-compatible server works. For Ollama:

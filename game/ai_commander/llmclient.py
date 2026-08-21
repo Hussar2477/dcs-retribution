@@ -325,6 +325,14 @@ class ChatCompletionClient:
         }
         if response_format is not None:
             payload["response_format"] = dict(response_format)
+            # Defense in depth for reasoning models: on structured decision
+            # calls, cap how much of the budget the model may spend on hidden
+            # reasoning so there is always headroom left for the JSON answer.
+            # This is an OpenRouter control; OpenRouter (and plain OpenAI /
+            # Ollama) ignore unknown fields, so this is a safe no-op elsewhere.
+            reasoning_cap = min(2000, int(max_output_tokens) // 2)
+            if reasoning_cap > 0:
+                payload["reasoning"] = {"max_tokens": reasoning_cap}
         if self.session_id:
             payload["user"] = self.session_id
 
@@ -351,16 +359,24 @@ class ChatCompletionClient:
         text = ""
         had_tool_calls = False
         if isinstance(message, Mapping):
-            content = message.get("content")
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                # Some providers return content parts rather than a plain string.
-                text = "".join(
-                    str(part.get("text", ""))
-                    for part in content
-                    if isinstance(part, Mapping)
-                )
+            text = _text_from_field(message.get("content"))
+            if not text.strip():
+                # Reasoning models emit their thinking into a separate channel
+                # before the visible answer; when the budget is tight the JSON
+                # answer can land there instead of in ``content``, leaving
+                # ``content`` empty. Recover it from the reasoning channel only
+                # when ``content`` yielded nothing, so normal replies are never
+                # affected. OpenRouter uses ``reasoning``; some providers use
+                # ``reasoning_content``.
+                reasoning_text = _text_from_field(
+                    message.get("reasoning_content")
+                ) or _text_from_field(message.get("reasoning"))
+                if reasoning_text.strip():
+                    logging.info(
+                        "LLM content was empty; recovered answer from the "
+                        "reasoning channel (reasoning-model fallback)"
+                    )
+                    text = reasoning_text
             had_tool_calls = bool(message.get("tool_calls"))
         if had_tool_calls:
             logging.warning(
@@ -376,6 +392,22 @@ class ChatCompletionClient:
             latency_seconds=latency,
             had_tool_calls=had_tool_calls,
         )
+
+
+def _text_from_field(value: Any) -> str:
+    """Extract text from a chat field that is either a string or content parts.
+
+    Providers return message ``content`` (and reasoning channels) as either a
+    plain string or a list of ``{"text": ...}`` parts; this normalises both.
+    """
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            str(part.get("text", "")) for part in value if isinstance(part, Mapping)
+        )
+    return ""
 
 
 def _read_error_body(err: urllib.error.HTTPError) -> str:
