@@ -1592,7 +1592,7 @@ class Settings:
         "Maximum response tokens",
         page=AI_OPPONENT_PAGE,
         section=LLM_COMMANDER_SECTION,
-        default=2000,
+        default=12000,
         min=256,
         max=16000,
         detail=(

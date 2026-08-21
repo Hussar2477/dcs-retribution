@@ -532,7 +532,7 @@ All of the following is on the **AI Opponent** settings page.
 | `ai_commander_intel_policy` | `realistic` | See section 5. |
 | `ai_commander_cost_cap_per_turn` | `0.5` | US dollars, per RED turn, worst case, enforced *before* sending. |
 | `ai_commander_timeout_seconds` | `90` | Exceeded means fall back. |
-| `ai_commander_max_output_tokens` | `2000` | Caps the size, and therefore the cost, of each response. |
+| `ai_commander_max_output_tokens` | `12000` | Caps the size, and therefore the cost, of each response. |
 | `ai_commander_log_prompts` | `True` | Store raw prompts in the audit record. They contain campaign information (though no BLUE-private data), so this is user-configurable. |
 | `ai_commander_fallback_to_builtin` | `True` | Keep this on. |
 
@@ -670,6 +670,14 @@ the cap is a safety net against a pathological prompt or a price change, not a
 routine constraint. A hundred-turn campaign on the shipped default costs on the
 order of two US cents.
 
+> **Note on the token cap.** The worst-case figures above use the harness's
+> 2000-token reference cap. The shipped `ai_commander_max_output_tokens` default
+> was raised to 12000 so reasoning-heavy models no longer exhaust the budget on
+> hidden thinking and return empty stages. At 12000 the COMMANDER worst-case
+> output reservation is six times larger, but even the most expensive surveyed
+> model (`kimi-k3`, and the identical pessimistic fallback price) reaches only
+> about $0.37 per turn — still under the $0.50 ceiling for every surveyed model.
+
 These are estimates from measured character counts and published prices, not
 observed invoices. Prices were recorded on 2026-08-05 and change without notice;
 the controller always prices from the live `/models` catalogue at runtime and
@@ -717,6 +725,20 @@ cannot be read, which lands at roughly $0.23, a little over 2x headroom. The
 shipped default keeps two orders of magnitude of margin. ACTIVE mode costs
 roughly four times a COMMANDER turn because it makes three to six calls instead
 of one to two, and the cap absorbs that comfortably.
+
+> **Note on the token cap.** As with COMMANDER mode, the worst-case figures
+> above use the harness's 2000-token reference cap. With the shipped
+> `ai_commander_max_output_tokens` default now 12000, the worst-case output
+> reservation for a fully-repaired six-call turn is six times larger. The
+> shipped default and the cheaper models stay well under $0.50 even then
+> (`deepseek` ≈ $0.015), but the two most expensive surveyed models
+> (`kimi-k3` and the identical pessimistic fallback price) would reserve about
+> $1.13 for that worst-case turn — over the ceiling. Because the shared
+> `CostLedger` reserves each stage's worst case *before sending*, it refuses
+> those later stages and they fall back to the built-in planner, so the $0.50
+> ceiling is still never exceeded — the cap doing exactly its job. Operators who
+> select such an expensive model in ACTIVE mode should lower
+> `ai_commander_max_output_tokens` to keep all three stages within the cap.
 
 ## 9. Tests and the dry-run harness
 

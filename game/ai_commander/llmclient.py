@@ -31,7 +31,7 @@ from game.ai_commander.serialization import jsonable
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_TIMEOUT_SECONDS = 90
-DEFAULT_MAX_OUTPUT_TOKENS = 2000
+DEFAULT_MAX_OUTPUT_TOKENS = 12000
 
 #: Identifies the application to OpenRouter. Contains no user data.
 APPLICATION_TITLE = "DCS Retribution LLM RED Commander"
