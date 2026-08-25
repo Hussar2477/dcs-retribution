@@ -306,18 +306,59 @@ class TestStageDegradation:
 
 
 class TestLiveStalenessGuard:
-    def test_spending_in_stage_two_makes_stage_three_stale(self, tmp_path: Any) -> None:
+    def test_the_commanders_own_spending_no_longer_makes_stage_three_stale(
+        self, tmp_path: Any
+    ) -> None:
         # The full logistics plan repairs a runway, which debits the budget and
         # therefore changes the campaign revision. Stage 3's payload still
-        # carries the revision from the start of the turn, so its staleness
-        # guard -- which recomputes the live revision -- correctly rejects it.
+        # carries the revision from the start of the turn, but the guard is
+        # re-baselined after the commander's OWN applied logistics, so the live
+        # revision matches the refreshed baseline and stage 3 is accepted --
+        # the commander's own spending must not trip the staleness check.
         turn = _Turn()
         result, _ = turn.run(
             [turn.stage1(), turn.stage2_full(), turn.stage3()], tmp_path
         )
-        assert result.accepted  # the turn still stands on stage 1 + stage 2
+        assert result.accepted
         assert result.execution is not None
         assert result.execution.spent == pytest.approx(100.0)
+        summary = describe_turn_result(result)
+        assert summary["stages"]["logistics"] == "accepted"
+        assert summary["stages"]["air_tasking"] == "accepted"
+        assert summary["packages_added"] >= 1
+
+    def test_an_external_change_after_logistics_still_rejects_stage_three(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Anti-tamper is preserved: if campaign state changes for a reason NOT
+        # explained by the commander's own applied orders (simulated here by an
+        # external budget mutation applied *after* the refreshed baseline is
+        # taken but *before* the air tasking check), stage 3 is still rejected
+        # as stale and its packages are left to the built-in planner.
+        turn = _Turn()
+
+        from game.ai_commander import controller as controller_module
+
+        original = controller_module.RedCommanderTurn._refreshed_revision
+
+        def tampering_refresh(self: Any) -> Any:
+            # Take the genuine refreshed baseline, then simulate an external
+            # actor mutating the campaign afterwards so the live revision the
+            # air tasking check recomputes no longer matches the baseline.
+            baseline = original(self)
+            self.coalition.adjust_budget(12345.0)
+            return baseline
+
+        monkeypatch.setattr(
+            controller_module.RedCommanderTurn,
+            "_refreshed_revision",
+            tampering_refresh,
+        )
+
+        result, _ = turn.run(
+            [turn.stage1(), turn.stage2_full(), turn.stage3()], tmp_path
+        )
+        assert result.accepted  # the turn still stands on stage 1 + stage 2
         summary = describe_turn_result(result)
         assert summary["stages"]["logistics"] == "accepted"
         assert summary["stages"]["air_tasking"] == "stale_response"

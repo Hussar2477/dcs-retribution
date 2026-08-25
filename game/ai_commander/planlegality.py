@@ -258,6 +258,7 @@ class PlanLegalityChecker:
         brief: OperationsBrief,
         resolver: OperationsResolver,
         capabilities: CapabilityIndex,
+        expected_revision: Optional[str] = None,
     ) -> None:
         from game.theater.player import Player
 
@@ -265,6 +266,12 @@ class PlanLegalityChecker:
         self.brief = brief
         self.resolver = resolver
         self.capabilities = capabilities
+        # Optional baseline the live revision must match. When set (ACTIVE mode
+        # re-baselines it after the commander's own applied stages) it overrides
+        # the plan's echoed turn-start revision, so the commander's own already
+        # applied orders do not trip the staleness guard. When unset, behaviour
+        # is unchanged: the guard compares against the plan's echoed revision.
+        self.expected_revision = expected_revision
         self.player = Player.RED
         self.coalition = game.coalition_for(self.player)
 
@@ -290,7 +297,15 @@ class PlanLegalityChecker:
 
     def _revision_rejection(self, revision: str) -> Optional[Rejection]:
         live = self._live_revision()
-        if live is not None and live != revision:
+        # Compare the recomputed live revision against the explicit baseline when
+        # one was supplied (ACTIVE mode re-baselines after its own applied
+        # stages); otherwise fall back to the plan's echoed turn-start revision.
+        # The rejection still reports the plan's echoed revision either way, so
+        # audit/log wording is unchanged.
+        baseline = (
+            self.expected_revision if self.expected_revision is not None else revision
+        )
+        if live is not None and live != baseline:
             return Rejection("campaign_revision", STATE_CHANGED, revision)
         return None
 

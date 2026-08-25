@@ -401,10 +401,20 @@ class RedCommanderTurn:
         decisions: list[str] = [directive.render_summary()]
         executor = PlanExecutor(self.game, self.coalition)
 
+        # The air tasking staleness guard compares the live revision against a
+        # baseline. It starts at the turn-start revision the brief echoes; once
+        # the commander applies its own logistics that legitimately changes
+        # campaign state, so the baseline is re-computed to reflect the
+        # commander's OWN applied orders. Otherwise the commander's own spending
+        # would look like external tampering and falsely reject air tasking. A
+        # genuine external change still differs from this baseline and is caught.
+        air_tasking_baseline: Optional[str] = brief.campaign_revision
+
         # -- stage 2: logistics -------------------------------------------
         logistics = self._active_logistics_stage(client, price, "\n".join(decisions))
         if logistics is not None:
             executor.execute_logistics(logistics)
+            air_tasking_baseline = self._refreshed_revision()
             decisions.append("")
             decisions.append("Logistics orders applied this turn:")
             decisions.extend(f"  {line}" for line in logistics.describe())
@@ -417,7 +427,9 @@ class RedCommanderTurn:
             )
 
         # -- stage 3: air tasking -----------------------------------------
-        tasking = self._active_air_tasking_stage(client, price, "\n".join(decisions))
+        tasking = self._active_air_tasking_stage(
+            client, price, "\n".join(decisions), expected_revision=air_tasking_baseline
+        )
         if tasking is not None:
             executor.execute_air_tasking(tasking)
 
@@ -633,8 +645,16 @@ class RedCommanderTurn:
         client: ChatCompletionClient,
         price: ModelPrice,
         prior_summary: str,
+        expected_revision: Optional[str] = None,
     ) -> Optional[ExecutableAirTasking]:
-        """Stage 3. The air tasking order, one package at a time."""
+        """Stage 3. The air tasking order, one package at a time.
+
+        ``expected_revision`` is the live campaign revision that reflects the
+        commander's OWN applied logistics from earlier this turn. The staleness
+        guard compares against it rather than the turn-start revision the plan
+        echoes, so the commander's own spending does not falsely trip the guard;
+        genuine external changes still differ from this baseline and are caught.
+        """
 
         assert self.operations is not None
         assert self.capabilities is not None
@@ -664,7 +684,9 @@ class RedCommanderTurn:
             entry.notes.append("the commander ordered no packages of its own")
             return None
 
-        executable, rejections = self._plan_checker().check_air_tasking(plan)
+        executable, rejections = self._plan_checker(
+            expected_revision=expected_revision
+        ).check_air_tasking(plan)
         payloads = [r.to_dict() for r in rejections]
         entry.rejections.extend(payloads)
         self.record.rejections.extend(payloads)
@@ -687,11 +709,40 @@ class RedCommanderTurn:
         }
         return executable
 
-    def _plan_checker(self) -> PlanLegalityChecker:
+    def _refreshed_revision(self) -> Optional[str]:
+        """Live campaign revision after the commander's own applied stages.
+
+        Used as the air tasking staleness baseline so the commander's own
+        already-applied logistics are not mistaken for external tampering. Uses
+        the same projector/intel policy the checker recomputes with, so the two
+        revisions are computed identically. On failure it returns the turn-start
+        revision; the checker's own recompute would fail the same way and simply
+        not reject, so no false rejection results.
+        """
+
+        assert self.operations is not None
+        assert self.brief is not None
+        try:
+            return IntelProjector(
+                self.game, self.operations.intel_policy
+            ).campaign_revision()
+        except Exception:  # pragma: no cover - defensive
+            logging.debug(
+                "Could not recompute refreshed campaign revision", exc_info=True
+            )
+            return self.brief.campaign_revision
+
+    def _plan_checker(
+        self, expected_revision: Optional[str] = None
+    ) -> PlanLegalityChecker:
         assert self.operations is not None
         assert self.capabilities is not None
         return PlanLegalityChecker(
-            self.game, self.operations, self.resolver, self.capabilities
+            self.game,
+            self.operations,
+            self.resolver,
+            self.capabilities,
+            expected_revision=expected_revision,
         )
 
     def _attempts_of(self, entry: StageRecord) -> list[LlmAttempt]:

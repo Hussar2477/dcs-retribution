@@ -335,6 +335,21 @@ dry run both prove them:
   airframe is not one this faction operates`) and the package collapses. RED can
   only ever fly airframes in its own capability index.
 
+The `campaign_revision` guard (a digest of turn, RED budget, ownership and
+own ground forces) rejects any plan whose live digest no longer matches, so a
+genuine external state change between briefing and application is thrown out.
+But in ACTIVE mode the commander's *own* applied stage-2 orders (a runway
+repair or a purchase debits the budget) change that digest, which would
+otherwise make its own stage-3 air tasking look stale. So once stage-2
+logistics is applied, the guard is **re-baselined** to the digest that reflects
+the commander's own just-applied orders, and stage-3 is checked against that
+baseline instead of the turn-start one. The check is unchanged when no orders
+were applied (and in COMMANDER mode), and a real external change is still
+rejected — the re-baseline only absorbs the commander's own spending, never a
+third party's. `PlanLegalityChecker` takes an optional `expected_revision`
+override for this; the controller computes it with the same `IntelProjector`
+the checker uses so the two digests are always comparable.
+
 Because the capability index and operations brief are built from **RED's own
 coalition only** — `CapabilityIndexBuilder` reads RED's owned and buyable units
 and never touches `coalition.opponent` or `game.blue`, and `OperationsProjector`

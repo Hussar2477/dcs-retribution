@@ -226,6 +226,88 @@ class TestRevisionGuard:
         assert result is None
         assert [r.element for r in rejections] == ["campaign_revision"]
 
+    def test_expected_revision_override_re_baselines_air_tasking(self) -> None:
+        """The commander's OWN applied logistics must not trip the guard.
+
+        In ACTIVE mode the air tasking plan echoes the turn-start revision, but
+        the live revision has already moved because the commander's own
+        logistics spent money earlier this turn. Passing the refreshed live
+        revision as ``expected_revision`` re-baselines the guard against the
+        commander's own applied orders, so the stale echoed revision is no
+        longer treated as external tampering.
+        """
+
+        ctx = _context()
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.SEAD, aircraft_count=2),
+            ),
+        )
+        plan = AirTaskingPlan(
+            schema_version="red-commander-air-tasking/1",
+            turn_id=ctx.brief.turn_id,
+            # The plan echoes the turn-start revision, which differs from live
+            # because the commander's own logistics were already applied.
+            campaign_revision="turn-start-revision",
+            intent="test",
+            packages=(package,),
+        )
+        # ctx.revision is the live revision (the refreshed baseline the
+        # controller would compute after its own logistics applied).
+        checker = PlanLegalityChecker(
+            ctx.game,
+            ctx.brief,
+            ctx.resolver,
+            ctx.capabilities,
+            expected_revision=ctx.revision,
+        )
+        result, rejections = checker.check_air_tasking(plan)
+        assert rejections == []
+        assert result is not None
+        assert len(result.packages) == 1
+
+    def test_expected_revision_override_still_catches_external_change(self) -> None:
+        """Anti-tamper is preserved: a genuine external change is still caught.
+
+        If the live revision differs from the refreshed baseline for a reason
+        NOT explained by the commander's own applied orders, the guard must
+        still reject the whole air tasking stage as stale.
+        """
+
+        ctx = _context()
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.SEAD, aircraft_count=2),
+            ),
+        )
+        plan = AirTaskingPlan(
+            schema_version="red-commander-air-tasking/1",
+            turn_id=ctx.brief.turn_id,
+            campaign_revision="turn-start-revision",
+            intent="test",
+            packages=(package,),
+        )
+        # A baseline that matches neither the live revision nor the echoed one
+        # simulates an external mutation between the refreshed baseline and
+        # application: live != baseline, so the stage is rejected.
+        checker = PlanLegalityChecker(
+            ctx.game,
+            ctx.brief,
+            ctx.resolver,
+            ctx.capabilities,
+            expected_revision="externally-tampered-revision",
+        )
+        result, rejections = checker.check_air_tasking(plan)
+        assert result is None
+        assert [r.element for r in rejections] == ["campaign_revision"]
+        # The rejection still reports the plan's echoed revision, so audit
+        # wording is unchanged.
+        assert rejections[0].value == "turn-start-revision"
+
 
 # ---------------------------------------------------------------------------
 # Happy paths: a legal order of each class binds to live objects
