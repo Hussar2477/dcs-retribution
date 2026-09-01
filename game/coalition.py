@@ -47,6 +47,12 @@ class Coalition:
         self.armed_forces = ArmedForces(self.faction)
         self.transfers = PendingTransfers(game, player)
 
+        # Serialised after-action summary from the last resolved mission, used by
+        # the LLM AI commander to reason about what happened. A plain dict (see
+        # game.ai_commander.debrief.DebriefSummary.to_dict) so it survives
+        # save/load without pulling ai_commander into the coalition module.
+        self.last_after_action: Optional[dict[str, Any]] = None
+
         # Late initialized because the two coalitions in the game are mutually
         # dependent, so must be both constructed before this property can be set.
         self._opponent: Optional[Coalition] = None
@@ -113,6 +119,10 @@ class Coalition:
                 state["player"] = Player.RED
 
         self.__dict__.update(state)
+        # Backward compatibility: saves created before the AI after-action
+        # summary existed have no such attribute.
+        if not hasattr(self, "last_after_action"):
+            self.last_after_action = None
 
     def set_opponent(self, opponent: Coalition) -> None:
         if self._opponent is not None:

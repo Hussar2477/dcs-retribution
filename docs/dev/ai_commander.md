@@ -78,6 +78,7 @@ All of it lives in `game/ai_commander/`, plus one call site and the UI.
 | `enums.py` | Every closed vocabulary: intel policy, strategy, posture, target-set category, procurement category, mission purpose, reserve policy, confidence, precision, strength/affordability bands, personality, fallback reason. |
 | `serialization.py` | `jsonable()` and `stable_hash()` — deterministic, ordering-independent JSON and hashing used for every hash in the brief and the audit record. |
 | `intel.py` | `IntelProjector` and `RedCommanderBrief`. Builds the fair briefing; **this is the fairness boundary**. |
+| `debrief.py` | `DebriefSummary`, `build_debrief_summary`, `classify_threat` and `ThreatCategory`. Turns the last mission's debriefing into a compact, RED-perspective after-action summary — RED's own losses attributed to their cause, plus RED's confirmed enemy kills — that `intel.py` folds into the brief. Also off the fairness boundary (see §4.6). |
 | `postures.py` | Maps Retribution `CombatStance` values to/from the `FrontPosture` vocabulary, and computes which postures are legal on a front. |
 | `decision.py` | The decision JSON schema, the example document, `extract_json_object`, and `validate_decision` — schema/ID/rank/enum validation. |
 | `directive.py` | `CommanderDirective`, the validated, legality-checked intent object. |
@@ -356,6 +357,55 @@ and never touches `coalition.opponent` or `game.blue`, and `OperationsProjector`
 projects only RED-owned control points and *observable* targets — the model is
 never even shown a BLUE unit type, squadron or hidden base to name. The
 intel-leak sentinels in section 5 cover the operations brief too.
+
+### 4.6 The after-action debrief stays inside the fairness boundary
+
+After every mission the brief carries a compact after-action summary of the
+*previous* turn so the commander can learn from its losses — the concrete
+motivation being reactions a human RED player would have: "my CAS was shot down
+by enemy fighters, so escort it next time", or "my strike aircraft were downed
+by ship-launched SAMs, so kill the ships first". That summary is built by
+`game/ai_commander/debrief.py` and folded into the brief by `intel.py`, and it
+is held to the same anti-cheat rule as everything else the model sees: **it
+reports only RED's own losses (attributed to their cause) and the enemy losses
+RED actually confirmed in combat** — never BLUE's budget, inventory, plans, or
+un-observed movements.
+
+How it stays fair and cheap:
+
+* **Where the data comes from.** DCS already emits an `S_EVENT_KILL` for each
+  kill; the base plugin (`resources/plugins/base/dcs_retribution.lua`) now also
+  records the *cause* of each kill (`target`, `by`, `by_type`, `weapon`, each
+  captured defensively with `pcall`) into `kill_causes` in `state.json`. That
+  is parsed backward-compatibly into `StateData.kill_causes`
+  (`game/debriefing.py`); an older state file with no `kill_causes` simply
+  yields an empty list.
+* **RED perspective only.** In the debriefing, `player_*` is BLUE and `enemy_*`
+  is RED. `build_debrief_summary` counts RED's losses from
+  `loss_counts(Player.RED)` and RED's confirmed kills from
+  `loss_counts(Player.BLUE)` (i.e. BLUE units RED was observed to destroy). It
+  never reads BLUE's coalition, roster, or budget. The result is stored on the
+  RED coalition as `Coalition.last_after_action` (a plain dict) by
+  `MissionResultsProcessor.record_red_after_action`, the last step of `commit()`;
+  that step is wrapped in try/except so a debrief failure can never abort combat
+  resolution.
+* **Cause attribution.** Each RED loss with a known killer is classified by
+  `classify_threat(unit_class)` into a small closed `ThreatCategory` vocabulary
+  — enemy aircraft, ground SAM, naval (ship / ship-launched SAM), AAA, or ground
+  fire. Auto-resolved combat (the `SimulationResults` path) carries no unit
+  names or killers, so those losses cannot be attributed; they are counted from
+  the loss totals and bucketed as `UNKNOWN` by remainder math (total minus what
+  was attributed). Attribution is therefore best-effort and never over-claims.
+* **Token cost is bounded.** `DebriefSummary.render_compact()` emits a short
+  `[AFTER-ACTION …]` block (a handful of lines, well under the brief's other
+  sections) and returns `""` when the summary is empty, so a quiet turn adds
+  nothing. `IntelProjector` rehydrates it from the stored dict via
+  `DebriefSummary.from_dict` (garbage-tolerant) and renders it under
+  `[AFTER-ACTION LAST MISSION]`, guarded so an empty summary is omitted.
+* **Tested for leaks.** `tests/ai_commander/test_debrief.py` asserts the block
+  never carries a BLUE sentinel (same approach as the intel-leak tests in §5),
+  alongside classification, attribution, serialization round-trip, garbage
+  tolerance and the render length bound.
 
 ## 5. What `REALISTIC` withholds versus `FULL_PARITY`
 
@@ -785,6 +835,7 @@ campaign entirely out of stubs — no DCS, no mission files, no network:
 | `test_cost_cap.py` | Ledger arithmetic, refusal before sending when the worst-case reserve exceeds the cap, reserve/release/settle, and that the controller falls back instead of raising. |
 | `test_fallback.py` | Transport error, HTTP error, timeout, repeatedly malformed output, unexpected exception — every one ends in the deterministic fallback so a turn never breaks. |
 | `test_secrets_and_audit.py` | Key masking and redaction, that the key is absent from configs/records/reprs, audit record shape, per-turn cost accounting, and the replay guard. |
+| `test_debrief.py` | The after-action summary (§4.6): `classify_threat` mapping, cause attribution and the `UNKNOWN` remainder bucket, RED-perspective loss/kill counting, serialization round-trip and garbage tolerance, the `render_compact` length bound, and — same as `test_intel_leak.py` — that the rendered block leaks no BLUE information. |
 
 The ACTIVE-mode suite adds:
 

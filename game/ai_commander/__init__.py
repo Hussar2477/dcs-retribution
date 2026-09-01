@@ -42,6 +42,12 @@ from game.ai_commander.controller import (
     describe_turn_result,
     plan_red_commander_turn,
 )
+from game.ai_commander.debrief import (
+    DebriefSummary,
+    ThreatCategory,
+    build_debrief_summary,
+    classify_threat,
+)
 from game.ai_commander.decision import (
     RedCommanderDecision,
     ValidationOutcome,
@@ -103,6 +109,7 @@ __all__ = [
     "CommanderTurnResult",
     "CostCapExceeded",
     "CostLedger",
+    "DebriefSummary",
     "DirectedProcurementAi",
     "DirectedTheaterCommander",
     "ExecutableAirTasking",
@@ -130,9 +137,12 @@ __all__ = [
     "SecretStore",
     "StageRecord",
     "TargetSetCategory",
+    "ThreatCategory",
     "ValidationOutcome",
     "apply_front_postures",
+    "build_debrief_summary",
     "capability_index_for",
+    "classify_threat",
     "describe_turn_result",
     "parse_decision",
     "plan_red_commander_turn",

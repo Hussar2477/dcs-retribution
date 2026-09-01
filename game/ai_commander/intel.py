@@ -38,6 +38,7 @@ from game.ai_commander.enums import (
     StrengthBand,
     TargetSetCategory,
 )
+from game.ai_commander.debrief import DebriefSummary
 from game.ai_commander.serialization import jsonable, stable_hash
 
 if TYPE_CHECKING:
@@ -207,6 +208,10 @@ class RedCommanderBrief:
     prior_decision_summary: PriorTurnSummary
     prior_outcome_summary: PriorTurnSummary
     withheld_fields: tuple[str, ...] = field(default_factory=tuple)
+    #: Fair, RED-perspective debrief of the last resolved mission (own losses
+    #: attributed to their causes, plus confirmed BLUE losses). None on the very
+    #: first turn or when nothing has been flown yet.
+    after_action: Optional[DebriefSummary] = None
 
     # -- lookup helpers ---------------------------------------------------
 
@@ -363,6 +368,15 @@ class RedCommanderBrief:
                 f"budget_delta={outcome.budget_delta}"
             )
 
+        if self.after_action is not None and not self.after_action.is_empty:
+            lines += ["", "[AFTER-ACTION LAST MISSION]"]
+            lines.append(
+                "Your own losses attributed to what destroyed them, and enemy "
+                "losses you confirmed. Use this to adapt (e.g. escort strikes "
+                "hit by enemy aircraft, or suppress SAMs/ships downing you)."
+            )
+            lines.append(self.after_action.render_compact())
+
         if self.withheld_fields:
             lines += ["", "[WITHHELD]"]
             lines.append(
@@ -448,6 +462,7 @@ class IntelProjector:
         fronts = self._project_fronts()
         target_sets = self._project_target_sets(fronts)
         return RedCommanderBrief(
+            after_action=self._project_after_action(),
             schema_version=SCHEMA_VERSION,
             campaign_id_hash=self.campaign_id_hash(),
             campaign_revision=self.campaign_revision(),
@@ -469,6 +484,23 @@ class IntelProjector:
                 else FULL_PARITY_WITHHELD_FIELDS
             ),
         )
+
+    def _project_after_action(self) -> Optional[DebriefSummary]:
+        """Rebuild the stored RED after-action summary, if any.
+
+        The summary was written by the mission results processor from RED's own
+        losses and confirmed BLUE losses, so it carries no BLUE internals and is
+        safe under every intel policy.
+        """
+
+        stored = getattr(self.coalition, "last_after_action", None)
+        if not stored:
+            return None
+        try:
+            return DebriefSummary.from_dict(stored)
+        except Exception:  # noqa: BLE001 - a malformed summary is simply omitted
+            logging.warning("Ignoring malformed stored after-action summary")
+            return None
 
     def campaign_id_hash(self) -> str:
         """Stable identifier for this campaign, with no path or personal data."""
