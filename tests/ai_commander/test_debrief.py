@@ -30,7 +30,6 @@ from game.debriefing import SideLossCounts
 from game.theater import Player
 from tests.ai_commander import fakes
 
-
 # ---------------------------------------------------------------------------
 # classify_threat
 # ---------------------------------------------------------------------------
@@ -405,7 +404,9 @@ class TestAfterActionInTheBrief:
 
     def test_malformed_stored_summary_is_ignored(self) -> None:
         campaign, game = fakes.synthetic_game()
-        campaign.red.last_after_action = {"turn": object()}  # not serialisable/parseable
+        campaign.red.last_after_action = {
+            "turn": object()
+        }  # not serialisable/parseable
         brief = IntelProjector(game, IntelPolicy.REALISTIC).project()
         # from_dict coerces what it can; a truly broken store must not crash.
         assert isinstance(brief.render_compact(), str)

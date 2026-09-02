@@ -184,6 +184,9 @@ class StateData:
 
 
 class Debriefing:
+    air_losses: AirLosses
+    ground_losses: GroundLosses
+
     def __init__(
         self, state_data: Dict[str, Any], game: Game, unit_map: UnitMap
     ) -> None:
