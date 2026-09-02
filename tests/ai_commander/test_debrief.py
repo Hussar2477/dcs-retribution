@@ -13,7 +13,7 @@ These cover the four things that matter:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import pytest
 
@@ -29,6 +29,17 @@ from game.data.units import UnitClass
 from game.debriefing import SideLossCounts
 from game.theater import Player
 from tests.ai_commander import fakes
+
+if TYPE_CHECKING:
+    from game.debriefing import Debriefing
+    from game.game import Game
+
+
+def _build(debriefing: Any, game: Any) -> DebriefSummary:
+    """Call the summary builder with test fakes, satisfying mypy's arg types."""
+
+    return build_debrief_summary(cast("Debriefing", debriefing), cast("Game", game))
+
 
 # ---------------------------------------------------------------------------
 # classify_threat
@@ -236,7 +247,7 @@ class TestBuildDebriefSummary:
     def _summary(self) -> DebriefSummary:
         debriefing = self._scenario()
         game = SimpleNamespace(turn=12)
-        return build_debrief_summary(debriefing, game)
+        return _build(debriefing, game)
 
     def test_red_air_losses_attributed_by_cause(self) -> None:
         summary = self._summary()
@@ -296,7 +307,7 @@ class TestBuildDebriefSummary:
             blue_counts=_counts(),
             red_air_by_type={},
         )
-        summary = build_debrief_summary(debriefing, SimpleNamespace(turn=1))
+        summary = _build(debriefing, SimpleNamespace(turn=1))
         assert summary.is_empty
         assert summary.render_compact() == ""
 
@@ -311,7 +322,7 @@ class TestBuildDebriefSummary:
             blue_counts=_counts(),
             red_air_by_type={},
         )
-        summary = build_debrief_summary(debriefing, SimpleNamespace(turn=3))
+        summary = _build(debriefing, SimpleNamespace(turn=3))
         assert summary.red_aircraft_lost_by_cause == {"unknown": 4}
         assert summary.red_ground_units_lost_by_cause == {"unknown": 2}
 
