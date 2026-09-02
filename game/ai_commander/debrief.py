@@ -297,7 +297,12 @@ class DebriefSummary:
         if self.is_empty:
             return ""
 
-        lines = [f"[AFTER-ACTION turn={self.turn}]"]
+        lines = [
+            f"[AFTER-ACTION turn={self.turn}]",
+            "note: losses below already happened last turn and are reflected in "
+            "the current force counts above; do not reconcile or infer earlier "
+            "totals.",
+        ]
 
         if self.red_aircraft_lost:
             line = f"red_aircraft_lost={self.red_aircraft_lost}"

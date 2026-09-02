@@ -150,11 +150,19 @@ class BaseView:
         return jsonable(self)
 
     def render(self) -> str:
+        aircraft_on_order = (
+            f" on_order={self.aircraft_on_order}" if self.aircraft_on_order else ""
+        )
+        ground_on_order = (
+            f" on_order={self.ground_units_on_order}"
+            if self.ground_units_on_order
+            else ""
+        )
         parts = [
             f"{self.id} {self.name}",
             self.kind,
-            f"aircraft={self.aircraft_present}(+{self.aircraft_on_order})",
-            f"ground={self.ground_units_present}(+{self.ground_units_on_order})",
+            f"aircraft={self.aircraft_present}{aircraft_on_order}",
+            f"ground={self.ground_units_present}{ground_on_order}",
         ]
         if self.parking_free is not None:
             parts.append(f"parking_free={self.parking_free}")
@@ -206,10 +214,13 @@ class SquadronView:
             if self.relocating_to_base_id
             else ""
         )
+        on_order = (
+            f" on_order={self.aircraft_on_order}" if self.aircraft_on_order else ""
+        )
         return (
             f"{self.id} {self.name} | {self.aircraft_id} | at={self.base_id} "
-            f"| onhand={self.aircraft_on_hand} untasked={self.aircraft_untasked} "
-            f"(+{self.aircraft_on_order}) | pilots={self.pilots_available} "
+            f"| onhand={self.aircraft_on_hand} untasked={self.aircraft_untasked}"
+            f"{on_order} | pilots={self.pilots_available} "
             f"| plannable_now={self.max_fulfillable_aircraft} "
             f"| ${self.price_per_aircraft}/airframe | can_fly={tasks} | auto={auto}"
             f"{relocation}"

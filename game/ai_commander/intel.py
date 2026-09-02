@@ -282,14 +282,23 @@ class RedCommanderBrief:
             "[OWN FORCES]",
         ]
         summary = self.red_force_summary
+        aircraft_on_order = (
+            f" on_order={summary.aircraft_on_order}"
+            if summary.aircraft_on_order
+            else ""
+        )
+        ground_on_order = (
+            f" on_order={summary.ground_units_on_order}"
+            if summary.ground_units_on_order
+            else ""
+        )
         lines.append(
             f"bases={summary.control_points_held} "
             f"airbases_ok={summary.airbases_operational} "
             f"runways_damaged={summary.airbases_runway_damaged} "
-            f"aircraft={summary.aircraft_available}(+{summary.aircraft_on_order}) "
+            f"aircraft={summary.aircraft_available}{aircraft_on_order} "
             f"squadrons={summary.squadrons_available} "
-            f"ground={summary.ground_units_deployed}"
-            f"(+{summary.ground_units_on_order}) "
+            f"ground={summary.ground_units_deployed}{ground_on_order} "
             f"fronts={summary.active_fronts}"
         )
 

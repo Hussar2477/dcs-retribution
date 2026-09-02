@@ -356,6 +356,24 @@ class TestRenderingAndSerialisation:
         assert "confirmed_enemy_losses" in rendered
         assert "bases_captured=1" in rendered
 
+    def test_after_action_clarifier_present_when_there_are_losses(self) -> None:
+        # The clarifier stops the model back-calculating previous force totals
+        # from the losses (the reasoning-loop root cause).
+        rendered = self._summary().render_compact()
+        assert "already happened last turn" in rendered
+        assert "do not reconcile or infer earlier" in rendered
+        # It sits directly under the header, before the loss figures.
+        header_index = rendered.index("[AFTER-ACTION turn=9]")
+        note_index = rendered.index("already happened last turn")
+        losses_index = rendered.index("red_aircraft_lost=2")
+        assert header_index < note_index < losses_index
+
+    def test_no_clarifier_when_the_turn_is_quiet(self) -> None:
+        quiet = DebriefSummary(turn=4)
+        rendered = quiet.render_compact()
+        assert rendered == ""
+        assert "already happened last turn" not in rendered
+
     def test_render_is_compact(self) -> None:
         # A whole after-action block should stay small (token budget guard).
         assert len(self._summary().render_compact()) < 600

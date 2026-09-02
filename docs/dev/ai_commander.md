@@ -424,6 +424,19 @@ How it stays fair and cheap:
   nothing. `IntelProjector` rehydrates it from the stored dict via
   `DebriefSummary.from_dict` (garbage-tolerant) and renders it under
   `[AFTER-ACTION LAST MISSION]`, guarded so an empty summary is omitted.
+* **A clarifier heads off a reasoning loop.** Directly under the
+  `[AFTER-ACTION …]` header the block carries one fixed line —
+  *"losses below already happened last turn and are reflected in the current
+  force counts above; do not reconcile or infer earlier totals."* A reasoning
+  model was seen looping when it tried to subtract these losses from the current
+  own-force counts to back-calculate a previous total. That was compounded by an
+  ambiguous on-order notation: the brief once rendered procurement as
+  `aircraft=81(+0)`, which reads like a turn-over-turn delta rather than the
+  units on order. Both the force summary (`intel.py`) and the base and squadron
+  lines (`operations.py`) now label the on-order count explicitly
+  (`aircraft=81 on_order=2`) and omit it entirely when it is zero
+  (`aircraft=81`). The clarifier states plainly that the losses are already
+  accounted for, so there is nothing to reconcile.
 * **Tested for leaks.** `tests/ai_commander/test_debrief.py` asserts the block
   never carries a BLUE sentinel (same approach as the intel-leak tests in §5),
   alongside classification, attribution, serialization round-trip, garbage
@@ -880,6 +893,8 @@ campaign entirely out of stubs — no DCS, no mission files, no network:
 | `test_llmclient.py` | The transport client: the reasoning soft-cap formula and its ceiling, the anti-repetition penalties sent by default and their configurability, and truncation detection (`was_truncated` on `finish_reason` of `length`; `looks_truncated` when an empty answer follows a reasoning channel that consumed most of the budget). |
 | `test_truncation_repair.py` | Truncation-aware repair: a cut-off first reply enlarges the single repair's output budget; an empty-but-reasoning-exhausted reply is treated the same; an ordinary schema error keeps the normal budget; the enlargement clamps to the 32000 ceiling; and the audit note distinguishes the cut-off case from a schema failure. |
 | `test_capture_awareness.py` | Front-line and base-capture awareness (§4.1): the misleading "cannot capture bases" wording is gone, the indirect-capture chain and every posture are explained, per-front `capture_status` reports `available` / `needs force advantage` / `blocked (N …)` correctly, and the rendered status carries no BLUE-leak sentinels. |
+| `test_on_order_notation.py` | The on-order rendering (§4.6): the force summary (`intel.py`) and the base and squadron lines (`operations.py`) omit the on-order count when it is zero and label it `on_order=N` when positive — never the old delta-like `(+N)`. |
+| `test_air_tasking_prompt.py` | The stage-3 air-tasking briefing restates the two legality rules the model broke live: a flight's `mission_type` must be in the target's briefed `missions=` list (only Escort / SEAD Escort may be added), and each `target_id` may appear in at most one package. |
 
 The ACTIVE-mode suite adds:
 

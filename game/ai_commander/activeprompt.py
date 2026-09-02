@@ -105,7 +105,12 @@ _STAGE_BRIEFING: dict[CommanderStage, str] = {
         "mission planner turns each package into routes, altitudes, timings, "
         "loadouts and escorts, and will refuse a package it cannot crew or "
         "reach. Plan the packages that serve your intent; leftover capacity is "
-        "planned for you."
+        "planned for you. Two rules the planner enforces: (1) each flight's "
+        "mission_type must be one of the mission types listed in that target's "
+        "own missions= field in the briefing -- the only additions allowed "
+        "beyond that list are Escort and SEAD Escort as supporting flights; "
+        "(2) attack each target with at most one package -- never repeat a "
+        "target_id."
     ),
 }
 
