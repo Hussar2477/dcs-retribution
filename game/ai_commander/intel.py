@@ -96,6 +96,11 @@ class FrontView:
     legal_postures: tuple[FrontPosture, ...]
     current_posture: Optional[FrontPosture]
     reinforcement_eligible: bool
+    #: RED-observable base-capture status for this front: how many enemy battle
+    #: positions still block a capture and whether a breakthrough could take the
+    #: base now. Derived only from front-line reconnaissance and RED's own force
+    #: balance -- no BLUE-internal information.
+    capture_status: str = ""
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -156,8 +161,12 @@ class CommanderConstraints:
                 "identifiers are rejected.",
                 "Ranks start at 1 and must be unique within each list.",
                 "You cannot create units, set prices, choose aircraft types, "
-                "pick individual targets, plan routes or loadouts, move the "
-                "front line, capture bases or spend more than the listed budget.",
+                "pick individual targets, plan routes or loadouts, or spend more "
+                "than the listed budget. There is no direct 'capture' order: "
+                "instead you advance the front and take enemy bases indirectly "
+                "through aggressive postures (push, then breakthrough) backed by "
+                "a force advantage -- see the posture legend and capture chain "
+                "below.",
                 "A posture that is not listed as legal for a front is rejected.",
                 "Every decision is re-validated against live campaign state "
                 "before anything is applied.",
@@ -300,6 +309,7 @@ class RedCommanderBrief:
                 f"own={front.own_deployable_units}/{front.own_unit_capacity} | "
                 f"{enemy} | legal={postures} | current={current} | "
                 f"reinforceable={'yes' if front.reinforcement_eligible else 'no'}"
+                + (f" | {front.capture_status}" if front.capture_status else "")
                 + (f" | {front.notes}" if front.notes else "")
             )
 
@@ -341,6 +351,23 @@ class RedCommanderBrief:
         )
         for rule in constraints.rules:
             lines.append(f"- {rule}")
+        lines += ["", "[POSTURE LEGEND]"]
+        lines += [
+            "retreat: give ground; pull back from the front.",
+            "hold: defend in place; no advance.",
+            "probe: limited pressure to test the enemy without committing.",
+            "push: advance the front, grinding enemy battle positions down.",
+            "breakthrough: advance AND capture the enemy base once the battle "
+            "positions blocking it have been cleared.",
+        ]
+        lines += ["", "[CAPTURE CHAIN]"]
+        lines += [
+            "To take an enemy base: first eliminate the enemy battle positions "
+            "guarding it (rank the enemy_battle_positions target set highest on "
+            "that front), then set breakthrough there while holding a force "
+            "advantage. Each front's capture= status shows how many positions "
+            "still block it.",
+        ]
 
         prior = self.prior_decision_summary
         if prior.turn is not None:
@@ -623,7 +650,11 @@ class IntelProjector:
             return []
 
     def _project_fronts(self) -> tuple[FrontView, ...]:
-        from game.ai_commander.postures import legal_postures_for, posture_of_stance
+        from game.ai_commander.postures import (
+            capture_status_for,
+            legal_postures_for,
+            posture_of_stance,
+        )
 
         views: list[FrontView] = []
         for index, front_line in enumerate(self._active_front_lines(), start=1):
@@ -652,6 +683,7 @@ class IntelProjector:
                     reinforcement_eligible=bool(
                         own_cp.has_ground_unit_source(self.game)
                     ),
+                    capture_status=capture_status_for(front_line, self.player),
                 )
             )
         return tuple(views)

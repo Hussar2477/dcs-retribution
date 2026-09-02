@@ -77,6 +77,7 @@ from game.ai_commander.planlegality import (
     PlanLegalityChecker,
 )
 from game.ai_commander.llmclient import (
+    MAX_OUTPUT_TOKENS_CEILING,
     ChatCompletionClient,
     LlmError,
     LlmHttpError,
@@ -281,6 +282,35 @@ class RedCommanderTurn:
             return self._run_active(client, price)
         return self._run_commander(client, price)
 
+    # A truncation-specific instruction for the one repair that follows a
+    # cut-off answer. It steers the model away from re-deriving its reasoning
+    # (the loop that burned the whole output budget in the first place) and
+    # towards emitting only the final JSON.
+    _TRUNCATION_REPAIR_SUMMARY = (
+        "The previous answer was cut off before it finished (it ran out of "
+        "output budget while reasoning). Reply with ONLY the final JSON object "
+        "for this decision, as briefly as possible. Do not restate or repeat "
+        "your reasoning."
+    )
+
+    def _repair_budget(self, response: LlmResponse) -> tuple[int, bool]:
+        """Decide the output budget for the single repair after a failure.
+
+        Returns ``(budget, truncated)``. When the failed response looks
+        truncated (cut off before the JSON could be emitted, typically because
+        the reasoning channel ate the whole budget) the one repair is given an
+        enlarged budget so it has room to finish -- capped at
+        ``MAX_OUTPUT_TOKENS_CEILING`` and still reserved against the cost
+        ledger, so the per-turn cap remains the final authority. A genuine
+        schema error keeps the ordinary budget: more room would not help and
+        would only cost more.
+        """
+
+        base = int(self.config.max_output_tokens)
+        if response.looks_truncated(base):
+            return min(int(base * 1.5), MAX_OUTPUT_TOKENS_CEILING), True
+        return base, False
+
     def _run_commander(
         self, client: ChatCompletionClient, price: ModelPrice
     ) -> CommanderTurnResult:
@@ -298,17 +328,30 @@ class RedCommanderTurn:
 
         # 4. At most one repair, with the validation errors and no new state.
         if not outcome.ok and response is not None:
+            repair_budget, truncated = self._repair_budget(response)
+            error_summary = (
+                self._TRUNCATION_REPAIR_SUMMARY
+                if truncated
+                else outcome.error_summary()
+            )
             repair = build_repair_messages(
                 brief,
                 config.personality,
                 response.text,
-                outcome.error_summary(),
+                error_summary,
             )
             self.record.notes.append(
-                "first response failed validation; one repair attempt made"
+                "first response was cut off (out of output budget); one enlarged "
+                f"repair attempt made (budget {repair_budget})"
+                if truncated
+                else "first response failed validation; one repair attempt made"
             )
             repaired, repair_response = self._attempt(
-                client, repair, price, kind="repair"
+                client,
+                repair,
+                price,
+                kind="repair",
+                max_output_tokens=repair_budget,
             )
             if repaired is not None:
                 outcome = repaired
@@ -503,6 +546,12 @@ class RedCommanderTurn:
             return entry, None
 
         if not outcome.ok and response is not None:
+            repair_budget, truncated = self._repair_budget(response)
+            error_summary = (
+                self._TRUNCATION_REPAIR_SUMMARY
+                if truncated
+                else outcome.error_summary()
+            )
             repair = build_stage_repair_messages(
                 stage,
                 brief,
@@ -510,10 +559,15 @@ class RedCommanderTurn:
                 capabilities,
                 config.personality,
                 response.text,
-                outcome.error_summary(),
+                error_summary,
                 prior_summary,
             )
-            entry.notes.append("first response failed validation; one repair made")
+            entry.notes.append(
+                "first response was cut off (out of output budget); one enlarged "
+                f"repair made (budget {repair_budget})"
+                if truncated
+                else "first response failed validation; one repair made"
+            )
             repaired, _ = self._attempt(
                 client,
                 repair,
@@ -522,6 +576,7 @@ class RedCommanderTurn:
                 parser=parser,
                 response_format=response_format,
                 stage=entry,
+                max_output_tokens=repair_budget,
             )
             if repaired is not None:
                 outcome = repaired
@@ -835,6 +890,8 @@ class RedCommanderTurn:
             base_url=self.config.base_url,
             timeout_seconds=self.config.timeout_seconds,
             session_id=f"{self.brief.campaign_id_hash}:{self.brief.turn_id}",
+            frequency_penalty=self.config.frequency_penalty,
+            presence_penalty=self.config.presence_penalty,
         )
         return self._client
 
@@ -898,6 +955,7 @@ class RedCommanderTurn:
         parser: Optional[Callable[[str], _StageOutcome]] = None,
         response_format: Any = _UNSET,
         stage: Optional[StageRecord] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> tuple[Optional[_StageOutcome], Optional[LlmResponse]]:
         """One request/validate cycle, fully accounted for.
 
@@ -909,6 +967,13 @@ class RedCommanderTurn:
         cost ledger, the reservation/release/settle discipline and the audit
         entry are the parts that must not diverge between stages, because a
         second copy of them is a second place for the cap to be wrong.
+
+        ``max_output_tokens`` overrides the configured budget for this one call.
+        The truncation-aware repair uses it to give an enlarged budget to the
+        single repair that follows a cut-off response. The cost ledger still
+        reserves against this value before the call, so an enlarged repair that
+        would breach the per-turn cap is refused rather than sent -- the cap is
+        never at the mercy of this override.
         """
 
         assert self.brief is not None
@@ -916,6 +981,7 @@ class RedCommanderTurn:
         brief = self.brief
         ledger = self.ledger
         config = self.config
+        budget = int(max_output_tokens or config.max_output_tokens)
         if parser is None:
             parser = self._parse_decision_outcome
         if response_format is _UNSET:
@@ -943,13 +1009,11 @@ class RedCommanderTurn:
             estimate_tokens(str(m.get("content", ""))) for m in messages
         )
         attempt.prompt_tokens = prompt_tokens
-        self.record.estimated_cost += price.cost_for(
-            prompt_tokens, config.max_output_tokens
-        )
+        self.record.estimated_cost += price.cost_for(prompt_tokens, budget)
 
         try:
             reserved = ledger.reserve(
-                price, prompt_tokens, config.max_output_tokens, label=f"{kind} request"
+                price, prompt_tokens, budget, label=f"{kind} request"
             )
         except CostCapExceeded as error:
             attempt.error = str(error)
@@ -966,7 +1030,7 @@ class RedCommanderTurn:
         try:
             response = client.complete(
                 messages,
-                max_output_tokens=config.max_output_tokens,
+                max_output_tokens=budget,
                 response_format=response_format,
             )
         except LlmError as error:

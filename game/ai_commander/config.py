@@ -28,8 +28,10 @@ from game.ai_commander.enums import (
 )
 from game.ai_commander.llmclient import (
     DEFAULT_BASE_URL,
+    DEFAULT_FREQUENCY_PENALTY,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MODEL,
+    DEFAULT_PRESENCE_PENALTY,
     DEFAULT_TIMEOUT_SECONDS,
 )
 from game.ai_commander.secretstore import SecretStore, mask
@@ -72,6 +74,10 @@ class AiCommanderConfig:
     cost_cap_per_turn: float = 0.5
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    #: Anti-repetition penalties passed to the client. Defaults are active with
+    #: no configuration; they discourage the reasoning-loop truncation failure.
+    frequency_penalty: float = DEFAULT_FREQUENCY_PENALTY
+    presence_penalty: float = DEFAULT_PRESENCE_PENALTY
     log_prompts: bool = True
     fallback_to_builtin: bool = True
     #: Where the decision log is written. ``None`` means "work it out from the
@@ -145,6 +151,8 @@ class AiCommanderConfig:
             "cost_cap_per_turn": self.cost_cap_per_turn,
             "timeout_seconds": self.timeout_seconds,
             "max_output_tokens": self.max_output_tokens,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
             "log_prompts": self.log_prompts,
             "fallback_to_builtin": self.fallback_to_builtin,
             "api_key_configured": self.api_key is not None,
@@ -221,7 +229,7 @@ class AiCommanderConfig:
             ),
             DEFAULT_MAX_OUTPUT_TOKENS,
             256,
-            16000,
+            32000,
         )
 
         store = secret_store if secret_store is not None else SecretStore()

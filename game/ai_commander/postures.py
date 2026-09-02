@@ -149,6 +149,47 @@ def breakthrough_rejection(front_line: FrontLine, player: Player) -> Optional[st
     return None
 
 
+def capture_status_for(front_line: FrontLine, player: Player) -> str:
+    """A compact, RED-observable summary of whether the enemy base is capturable.
+
+    Base capture is reachable only through an aggressive posture: the enemy
+    battle positions that guard the base must be eliminated (targeted through
+    the ``enemy_battle_positions`` set) and then a ``breakthrough`` pressed on
+    that front while a force advantage holds. This states exactly where the
+    front stands against that chain, in the same terms RED could observe from
+    the front line itself.
+
+    Deliberately leaks nothing BLUE-internal: only the *count* of blocking
+    battle positions (legitimate front-line reconnaissance, already used to
+    gate breakthrough) and whether RED's own force balance currently satisfies
+    the breakthrough precondition. No BLUE plans, budgets, rosters or exact
+    positions of unobserved units are ever exposed.
+    """
+
+    from game.commander.battlepositions import BattlePositions
+
+    enemy_cp = front_line.control_point_hostile_to(player)
+    try:
+        blocking = len(BattlePositions.for_control_point(enemy_cp).blocking_capture)
+    except Exception:  # pragma: no cover - defensive
+        logging.debug("Could not read battle positions", exc_info=True)
+        return "capture=unknown (battle positions could not be evaluated)"
+
+    if blocking:
+        return (
+            f"capture=blocked ({blocking} enemy battle position(s) to eliminate "
+            "first via enemy_battle_positions, then breakthrough)"
+        )
+    if posture_is_legal(FrontPosture.BREAKTHROUGH, front_line, player):
+        return (
+            "capture=available (no blocking positions; breakthrough can take the base)"
+        )
+    return (
+        "capture=needs force advantage (no blocking positions, but force balance "
+        "does not yet permit breakthrough)"
+    )
+
+
 def posture_rejection_for(
     posture: FrontPosture, front_line: FrontLine, player: Player
 ) -> Optional[str]:

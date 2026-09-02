@@ -1592,13 +1592,15 @@ class Settings:
         "Maximum response tokens",
         page=AI_OPPONENT_PAGE,
         section=LLM_COMMANDER_SECTION,
-        default=12000,
+        default=18000,
         min=256,
-        max=16000,
+        max=32000,
         detail=(
-            "Caps the size, and therefore the cost, of each response. A "
-            "commander decision is a short structured document; the default is "
-            "already generous."
+            "Caps the size, and therefore the cost, of each response. Reasoning "
+            "models spend much of this on hidden chain-of-thought before the "
+            "JSON answer, so the default is generous enough that reasoning and "
+            "the answer both fit even on the token-hungry air-tasking stage. The "
+            "per-turn spending cap still bounds cost regardless of this value."
         ),
     )
 

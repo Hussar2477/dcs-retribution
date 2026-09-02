@@ -158,7 +158,15 @@ raises**: every exit path either returns an accepted directive or a
 9. **At most one repair attempt.** If and only if validation failed *and* the
    remaining budget covers another worst-case call, one repair request is sent
    containing the validation errors and the same legal IDs — no extra hidden
-   state. There is no retry loop beyond this.
+   state. There is no retry loop beyond this. If the *first* reply was cut off
+   rather than merely malformed (`finish_reason` of `length`, or an empty answer
+   after the reasoning channel consumed most of the budget), the repair is given
+   a larger output budget — `min(round(budget × 1.5), 32000)` — so the single
+   retry has room to finish; a repair after an ordinary schema error keeps the
+   normal budget. The audit note records which case fired. The ledger still
+   reserves this (possibly larger) worst case before sending, so the enlarged
+   repair cannot breach the cost cap — it is refused and the turn falls back if
+   it would.
 10. **Legality check.** `LegalityChecker` re-tests the surviving decision
     against live state: is that front still ours, is that base still reachable
     and owned, can we actually afford the cheapest item in that spending
@@ -255,6 +263,20 @@ Everything RED can see about BLUE is deliberately coarse:
   the brief is built: `_is_observable()` keeps an object only if it sits inside
   RED's own threat zone or within 120 km (`_REALISTIC_OBSERVATION_RANGE_METERS`)
   of a RED-held control point.
+
+**Front-line and base-capture awareness.** So the commander understands how
+ground gains actually happen, each front line in the brief carries a
+`capture_status` produced by `postures.capture_status_for(...)`, and the compact
+brief closes with a `[POSTURE LEGEND]` (what each of retreat / hold / probe /
+push / breakthrough means) and a `[CAPTURE CHAIN]` note (eliminate the enemy
+battle positions guarding a base, then set breakthrough there while holding a
+force advantage — there is no direct "capture" order). This is all derived from
+what RED can already observe: `capture_status` reports only the *count* of enemy
+battle positions still blocking the objective and whether a breakthrough is
+currently legal there (`blocked (N …)`, `available`, `needs force advantage`, or
+`unknown`). It never exposes a BLUE unit name, group ID, coordinate, inventory
+or plan — `test_capture_awareness.py` asserts the rendered status carries none
+of the BLUE-leak sentinels, alongside the existing `test_intel_leak.py` checks.
 
 ### 4.2 It can only speak the closed decision vocabulary
 
@@ -597,7 +619,7 @@ All of the following is on the **AI Opponent** settings page.
 | `ai_commander_intel_policy` | `realistic` | See section 5. |
 | `ai_commander_cost_cap_per_turn` | `0.5` | US dollars, per RED turn, worst case, enforced *before* sending. |
 | `ai_commander_timeout_seconds` | `90` | Exceeded means fall back. |
-| `ai_commander_max_output_tokens` | `12000` | Caps the size, and therefore the cost, of each response. |
+| `ai_commander_max_output_tokens` | `18000` | Caps the size, and therefore the cost, of each response (min 256, max 32000). Raised from 12000 so reasoning-heavy models do not exhaust the budget in their hidden thinking channel and return a truncated stage. |
 | `ai_commander_log_prompts` | `True` | Store raw prompts in the audit record. They contain campaign information (though no BLUE-private data), so this is user-configurable. |
 | `ai_commander_fallback_to_builtin` | `True` | Keep this on. |
 
@@ -748,13 +770,30 @@ the cap is a safety net against a pathological prompt or a price change, not a
 routine constraint. A hundred-turn campaign on the shipped default costs on the
 order of two US cents.
 
-> **Note on the token cap.** The worst-case figures above use the harness's
-> 2000-token reference cap. The shipped `ai_commander_max_output_tokens` default
-> was raised to 12000 so reasoning-heavy models no longer exhaust the budget on
-> hidden thinking and return empty stages. At 12000 the COMMANDER worst-case
-> output reservation is six times larger, but even the most expensive surveyed
-> model (`kimi-k3`, and the identical pessimistic fallback price) reaches only
-> about $0.37 per turn — still under the $0.50 ceiling for every surveyed model.
+> **Note on the token cap and anti-truncation handling.** The worst-case figures
+> above use the harness's 2000-token reference cap. The shipped
+> `ai_commander_max_output_tokens` default was raised to **18000** (ceiling
+> 32000) so reasoning-heavy models no longer spend the whole budget in their
+> hidden thinking channel and return a truncated, unparseable stage. Two further
+> anti-truncation measures ship alongside it:
+>
+> * **Anti-repetition penalties.** Every request now carries a frequency penalty
+>   (0.4) and a presence penalty (0.3) by default, which stop a reasoning model
+>   looping on the same derivation until it exhausts the budget. Both are
+>   configurable (`frequency_penalty`, `presence_penalty`). The reasoning
+>   soft-cap is `min(4000, budget // 2)`.
+> * **Truncation-aware repair.** When a reply is cut off (see step 9), the single
+>   repair attempt is given a larger output budget — `min(round(budget × 1.5),
+>   32000)` — so the one retry has room to finish; a repair after an ordinary
+>   schema error keeps the normal budget.
+>
+> None of this can breach the ceiling. The shared `CostLedger` still reserves
+> each call's worst case *before sending*. At the 18000 default the most
+> expensive surveyed models (`kimi-k3` and the identical pessimistic fallback
+> price) can no longer fit a second worst-case call under $0.50, so the ledger
+> refuses the repair and the turn falls back — the cap doing exactly its job. The
+> shipped default and the cheaper models keep ample headroom (`deepseek` ≈ $0.01
+> per turn even with an enlarged repair).
 
 These are estimates from measured character counts and published prices, not
 observed invoices. Prices were recorded on 2026-08-05 and change without notice;
@@ -805,18 +844,20 @@ roughly four times a COMMANDER turn because it makes three to six calls instead
 of one to two, and the cap absorbs that comfortably.
 
 > **Note on the token cap.** As with COMMANDER mode, the worst-case figures
-> above use the harness's 2000-token reference cap. With the shipped
-> `ai_commander_max_output_tokens` default now 12000, the worst-case output
-> reservation for a fully-repaired six-call turn is six times larger. The
-> shipped default and the cheaper models stay well under $0.50 even then
-> (`deepseek` ≈ $0.015), but the two most expensive surveyed models
-> (`kimi-k3` and the identical pessimistic fallback price) would reserve about
-> $1.13 for that worst-case turn — over the ceiling. Because the shared
-> `CostLedger` reserves each stage's worst case *before sending*, it refuses
-> those later stages and they fall back to the built-in planner, so the $0.50
-> ceiling is still never exceeded — the cap doing exactly its job. Operators who
-> select such an expensive model in ACTIVE mode should lower
-> `ai_commander_max_output_tokens` to keep all three stages within the cap.
+> above use the harness's 2000-token reference cap, and the same anti-repetition
+> penalties and truncation-aware repair apply to every stage. With the shipped
+> `ai_commander_max_output_tokens` default now **18000** (ceiling 32000), and a
+> truncated stage's one repair enlarged to as much as 32000 tokens, the
+> worst-case output reservation for a fully-repaired six-call turn is many times
+> larger than the reference figures. The shipped default and the cheaper models
+> stay well under $0.50 even then (`deepseek` ≈ $0.03 per turn), while the most
+> expensive surveyed models would reserve far more than the ceiling for such a
+> turn. Because the shared `CostLedger` reserves each stage's worst case *before
+> sending*, it refuses any stage that would push the turn total past $0.50 and
+> that stage falls back to the built-in planner, so the ceiling is still never
+> exceeded — the cap doing exactly its job. Operators who select such an
+> expensive model in ACTIVE mode should lower `ai_commander_max_output_tokens` to
+> keep more stages within the cap.
 
 ## 9. Tests and the dry-run harness
 
@@ -836,6 +877,9 @@ campaign entirely out of stubs — no DCS, no mission files, no network:
 | `test_fallback.py` | Transport error, HTTP error, timeout, repeatedly malformed output, unexpected exception — every one ends in the deterministic fallback so a turn never breaks. |
 | `test_secrets_and_audit.py` | Key masking and redaction, that the key is absent from configs/records/reprs, audit record shape, per-turn cost accounting, and the replay guard. |
 | `test_debrief.py` | The after-action summary (§4.6): `classify_threat` mapping, cause attribution and the `UNKNOWN` remainder bucket, RED-perspective loss/kill counting, serialization round-trip and garbage tolerance, the `render_compact` length bound, and — same as `test_intel_leak.py` — that the rendered block leaks no BLUE information. |
+| `test_llmclient.py` | The transport client: the reasoning soft-cap formula and its ceiling, the anti-repetition penalties sent by default and their configurability, and truncation detection (`was_truncated` on `finish_reason` of `length`; `looks_truncated` when an empty answer follows a reasoning channel that consumed most of the budget). |
+| `test_truncation_repair.py` | Truncation-aware repair: a cut-off first reply enlarges the single repair's output budget; an empty-but-reasoning-exhausted reply is treated the same; an ordinary schema error keeps the normal budget; the enlargement clamps to the 32000 ceiling; and the audit note distinguishes the cut-off case from a schema failure. |
+| `test_capture_awareness.py` | Front-line and base-capture awareness (§4.1): the misleading "cannot capture bases" wording is gone, the indirect-capture chain and every posture are explained, per-front `capture_status` reports `available` / `needs force advantage` / `blocked (N …)` correctly, and the rendered status carries no BLUE-leak sentinels. |
 
 The ACTIVE-mode suite adds:
 

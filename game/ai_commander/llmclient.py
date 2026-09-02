@@ -31,7 +31,33 @@ from game.ai_commander.serialization import jsonable
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
 DEFAULT_TIMEOUT_SECONDS = 90
-DEFAULT_MAX_OUTPUT_TOKENS = 12000
+#: The air-tasking stage is the most token-hungry, and reasoning models spend a
+#: large slice of the budget on hidden chain-of-thought before the JSON answer.
+#: A real Decision Log showed a reasoning model loop on the air-tasking stage and
+#: burn the whole 12000-token budget in the reasoning channel, truncating the
+#: answer (finish_reason="length") before any JSON was produced. This is raised
+#: so reasoning + JSON both fit comfortably; the per-turn cost cap (enforced by
+#: the ledger before every call) still bounds spend regardless of this value.
+DEFAULT_MAX_OUTPUT_TOKENS = 18000
+
+#: Hard ceiling for the one *enlarged* repair a stage may make after a truncated
+#: response (see the controller's truncation-aware repair). Keeps the enlarged
+#: budget bounded; the cost ledger is the actual guarantee against overspend.
+MAX_OUTPUT_TOKENS_CEILING = 32000
+
+#: Anti-repetition controls sent on every chat/completions request. Reasoning
+#: models can fall into a loop that re-derives the same paragraph until the
+#: budget is exhausted; a modest frequency/presence penalty discourages this.
+#: Standard OpenAI-compatible parameters -- OpenRouter/DeepSeek honour them and
+#: providers that do not simply ignore unknown fields.
+DEFAULT_FREQUENCY_PENALTY = 0.4
+DEFAULT_PRESENCE_PENALTY = 0.3
+
+#: Ceiling on the reasoning-token budget for structured calls. The cap scales
+#: with the output budget (``max_output_tokens // _REASONING_CAP_DIVISOR``) but
+#: never exceeds this, so a big budget still leaves ample room for the JSON.
+_REASONING_CAP_CEILING = 4000
+_REASONING_CAP_DIVISOR = 2
 
 #: Identifies the application to OpenRouter. Contains no user data.
 APPLICATION_TITLE = "DCS Retribution LLM RED Commander"
@@ -133,6 +159,33 @@ class LlmResponse:
     attempts: int = 1
     had_tool_calls: bool = False
 
+    @property
+    def was_truncated(self) -> bool:
+        """Whether the answer was cut off before completing.
+
+        The unambiguous signal is ``finish_reason == "length"``: the provider
+        hit the output budget. A reasoning model that loops can also exhaust the
+        budget entirely inside its hidden reasoning channel, leaving no visible
+        answer at all -- that shows up as an empty ``text`` together with a
+        reasoning-token count that has consumed most of the budget.
+        """
+
+        return self.finish_reason == "length"
+
+    def looks_truncated(self, max_output_tokens: int) -> bool:
+        """Truncation, including the empty-answer-with-exhausted-reasoning case.
+
+        ``max_output_tokens`` is the budget the request was made with, needed to
+        judge whether the reasoning channel ate essentially all of it.
+        """
+
+        if self.was_truncated:
+            return True
+        if self.text.strip():
+            return False
+        budget = max(1, int(max_output_tokens))
+        return self.usage.reasoning_tokens >= 0.8 * budget
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "model": self.model,
@@ -179,6 +232,10 @@ class ChatCompletionClient:
     referer: str = APPLICATION_REFERER
     title: str = APPLICATION_TITLE
     session_id: Optional[str] = None
+    #: Anti-repetition penalties applied to every request. Defaults discourage
+    #: the reasoning-loop failure without any configuration.
+    frequency_penalty: float = DEFAULT_FREQUENCY_PENALTY
+    presence_penalty: float = DEFAULT_PRESENCE_PENALTY
     _opener: Any = field(default=None, repr=False, compare=False)
 
     # -- identity ---------------------------------------------------------
@@ -321,6 +378,11 @@ class ChatCompletionClient:
             "messages": [dict(m) for m in messages],
             "max_tokens": int(max_output_tokens),
             "temperature": float(temperature),
+            # Anti-repetition: discourages the reasoning-loop that re-derives the
+            # same text until the output budget is exhausted. Standard
+            # OpenAI-compatible parameters; ignored by providers that lack them.
+            "frequency_penalty": float(self.frequency_penalty),
+            "presence_penalty": float(self.presence_penalty),
             "stream": False,
         }
         if response_format is not None:
@@ -328,9 +390,13 @@ class ChatCompletionClient:
             # Defense in depth for reasoning models: on structured decision
             # calls, cap how much of the budget the model may spend on hidden
             # reasoning so there is always headroom left for the JSON answer.
-            # This is an OpenRouter control; OpenRouter (and plain OpenAI /
-            # Ollama) ignore unknown fields, so this is a safe no-op elsewhere.
-            reasoning_cap = min(2000, int(max_output_tokens) // 2)
+            # The cap scales with the (now larger) budget but is bounded, so the
+            # thinking phase is not starved yet the JSON always has room. This is
+            # an OpenRouter control; OpenRouter (and plain OpenAI / Ollama)
+            # ignore unknown fields, so this is a safe no-op elsewhere.
+            reasoning_cap = min(
+                _REASONING_CAP_CEILING, int(max_output_tokens) // _REASONING_CAP_DIVISOR
+            )
             if reasoning_cap > 0:
                 payload["reasoning"] = {"max_tokens": reasoning_cap}
         if self.session_id:

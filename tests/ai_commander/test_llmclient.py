@@ -12,7 +12,11 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Optional, Sequence
 
-from game.ai_commander.llmclient import ChatCompletionClient
+from game.ai_commander.llmclient import (
+    DEFAULT_FREQUENCY_PENALTY,
+    DEFAULT_PRESENCE_PENALTY,
+    ChatCompletionClient,
+)
 
 
 class _FakeResponse:
@@ -136,7 +140,8 @@ def test_reasoning_hint_only_added_with_response_format() -> None:
         response_format={"type": "json_object"},
     )
     payload = structured.sent_payloads[0]
-    assert payload["reasoning"] == {"max_tokens": 2000}
+    # min(_REASONING_CAP_CEILING=4000, 12000 // 2 = 6000) == 4000.
+    assert payload["reasoning"] == {"max_tokens": 4000}
 
 
 def test_reasoning_hint_scales_with_small_budget() -> None:
@@ -149,3 +154,77 @@ def test_reasoning_hint_scales_with_small_budget() -> None:
         response_format={"type": "json_object"},
     )
     assert structured.sent_payloads[0]["reasoning"] == {"max_tokens": 500}
+
+
+def test_reasoning_hint_capped_at_ceiling_for_large_budget() -> None:
+    """Even a very large budget caps reasoning at the ceiling, sparing the JSON."""
+
+    structured = _FakeOpener(_body_with_message({"content": _JSON_ANSWER}))
+    _client(structured).complete(
+        _messages(),
+        max_output_tokens=18000,
+        response_format={"type": "json_object"},
+    )
+    # min(_REASONING_CAP_CEILING=4000, 18000 // 2 = 9000) == 4000.
+    assert structured.sent_payloads[0]["reasoning"] == {"max_tokens": 4000}
+
+
+def test_anti_repetition_penalties_sent_on_every_request() -> None:
+    """frequency/presence penalties are always in the payload, defaults active."""
+
+    opener = _FakeOpener(_body_with_message({"content": _JSON_ANSWER}))
+    _client(opener).complete(_messages())
+    payload = opener.sent_payloads[0]
+    assert payload["frequency_penalty"] == DEFAULT_FREQUENCY_PENALTY
+    assert payload["presence_penalty"] == DEFAULT_PRESENCE_PENALTY
+
+
+def test_penalties_are_configurable_on_the_client() -> None:
+    """Overriding the client's penalties changes what is sent."""
+
+    opener = _FakeOpener(_body_with_message({"content": _JSON_ANSWER}))
+    client = ChatCompletionClient(
+        api_key="unit-test-key-never-real",
+        frequency_penalty=0.9,
+        presence_penalty=0.7,
+        _opener=opener,
+    )
+    client.complete(_messages())
+    payload = opener.sent_payloads[0]
+    assert payload["frequency_penalty"] == 0.9
+    assert payload["presence_penalty"] == 0.7
+
+
+def test_was_truncated_reflects_length_finish_reason() -> None:
+    """finish_reason == 'length' is the unambiguous truncation signal."""
+
+    body = _body_with_message({"content": _JSON_ANSWER})
+    body["choices"][0]["finish_reason"] = "length"
+    result = _client(_FakeOpener(body)).complete(_messages())
+    assert result.was_truncated is True
+    assert result.looks_truncated(18000) is True
+
+
+def test_looks_truncated_detects_empty_answer_with_exhausted_reasoning() -> None:
+    """No visible answer plus reasoning that ate the budget counts as truncated."""
+
+    body = _body_with_message({"content": ""})
+    body["choices"][0]["finish_reason"] = "stop"
+    body["usage"] = {
+        "prompt_tokens": 10,
+        "completion_tokens": 15000,
+        "completion_tokens_details": {"reasoning_tokens": 15000},
+    }
+    result = _client(_FakeOpener(body)).complete(_messages())
+    assert result.was_truncated is False
+    assert result.looks_truncated(18000) is True
+
+
+def test_looks_truncated_false_for_normal_answer() -> None:
+    """A complete answer that stopped normally is never treated as truncated."""
+
+    body = _body_with_message({"content": _JSON_ANSWER})
+    body["choices"][0]["finish_reason"] = "stop"
+    result = _client(_FakeOpener(body)).complete(_messages())
+    assert result.was_truncated is False
+    assert result.looks_truncated(18000) is False

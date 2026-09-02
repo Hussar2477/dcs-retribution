@@ -1095,6 +1095,10 @@ class ScriptedClient(ChatCompletionClient):
         self.script = list(script)
         self.calls: list[list[dict[str, str]]] = []
         self.response_formats: list[Any] = []
+        #: The ``max_output_tokens`` each ``complete`` call was made with, so a
+        #: test can prove that a truncation-aware repair asked for a larger
+        #: budget than the initial attempt.
+        self.max_output_tokens_calls: list[int] = []
         self.catalog = CATALOG_PAYLOAD if catalog is None else catalog
         self.catalog_error = catalog_error
         self.had_tool_calls = had_tool_calls
@@ -1116,11 +1120,16 @@ class ScriptedClient(ChatCompletionClient):
     ) -> LlmResponse:
         self.calls.append([dict(m) for m in messages])
         self.response_formats.append(response_format)
+        self.max_output_tokens_calls.append(int(max_output_tokens))
         if not self.script:
             raise AssertionError("ScriptedClient ran out of scripted responses")
         item = self.script.pop(0)
         if isinstance(item, BaseException):
             raise item
+        # A fully-formed response can be scripted directly (e.g. to simulate a
+        # truncated answer with finish_reason == "length").
+        if isinstance(item, LlmResponse):
+            return item
         return LlmResponse(
             text=str(item),
             usage=self.usage,
