@@ -396,13 +396,36 @@ class TestRenderingAndSerialisation:
         assert "SEAD/DEAD" in summary.render_compact()
 
     def test_no_guidance_when_causes_are_not_actionable(self) -> None:
-        # Losses only to ground fire / unknown carry no air-tasking directive.
+        # Losses only to unknown / unattributed causes carry no directive.
         summary = DebriefSummary(
             turn=5,
             red_ground_units_lost=2,
-            red_ground_units_lost_by_cause={"ground_fire": 2},
+            red_ground_units_lost_by_cause={"unknown": 2},
         )
         assert "next_turn:" not in summary.render_compact()
+
+    def test_ground_losses_to_ground_fire_advise_armour(self) -> None:
+        # Ground units killed by enemy ground fire -> mass heavier armour.
+        summary = DebriefSummary(
+            turn=6,
+            red_ground_units_lost=3,
+            red_ground_units_lost_by_cause={"ground_fire": 3},
+        )
+        rendered = summary.render_compact()
+        assert "next_turn:" in rendered
+        assert "heavier armour/anti-armour" in rendered
+
+    def test_ground_losses_to_enemy_air_advise_shorad(self) -> None:
+        # Ground units killed by enemy aircraft -> contest the air / SHORAD.
+        summary = DebriefSummary(
+            turn=6,
+            red_ground_units_lost=2,
+            red_ground_units_lost_by_cause={"enemy_aircraft": 2},
+        )
+        rendered = summary.render_compact()
+        assert "next_turn:" in rendered
+        assert "AAA/SAM/SHORAD" in rendered
+        assert "contest the air" in rendered
 
     def test_no_guidance_on_a_quiet_turn(self) -> None:
         assert "next_turn:" not in DebriefSummary(turn=4).render_compact()

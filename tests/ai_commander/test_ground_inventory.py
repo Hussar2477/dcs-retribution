@@ -15,6 +15,7 @@ from game.ai_commander.operations import BaseView
 def _base(
     ground_units_by_type: tuple[tuple[str, int], ...],
     ground_types_truncated: int = 0,
+    income_per_turn: float | None = None,
 ) -> BaseView:
     return BaseView(
         id="BASE-1",
@@ -34,6 +35,7 @@ def _base(
         can_recruit_ground_units=True,
         has_ground_unit_source=True,
         squadron_ids=(),
+        income_per_turn=income_per_turn,
     )
 
 
@@ -55,3 +57,21 @@ class TestGroundTypesRendering:
     def test_empty_inventory_omits_the_ground_types_field(self) -> None:
         rendered = _base(()).render()
         assert "ground_types" not in rendered
+
+
+class TestBaseIncomeRendering:
+    def test_income_is_shown_when_present(self) -> None:
+        rendered = _base((("T-72B", 8),), income_per_turn=12).render()
+        assert "income=12/turn" in rendered
+
+    def test_fractional_income_is_shown_compactly(self) -> None:
+        rendered = _base((), income_per_turn=2.5).render()
+        assert "income=2.5/turn" in rendered
+
+    def test_income_field_is_omitted_when_none(self) -> None:
+        rendered = _base((("T-72B", 8),)).render()
+        assert "income=" not in rendered
+
+    def test_income_field_is_omitted_when_zero(self) -> None:
+        rendered = _base((("T-72B", 8),), income_per_turn=0).render()
+        assert "income=" not in rendered

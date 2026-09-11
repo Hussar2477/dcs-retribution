@@ -291,36 +291,56 @@ class DebriefSummary:
                 parts.append(f"{category.label}={count}")
         return ", ".join(parts)
 
-    # Short, actionable directive for each threat that killed something this
-    # turn, so the after-action drives next turn's plan instead of just
+    # Short, actionable directive for each threat that killed RED *aircraft* this
+    # turn, so the after-action drives next turn's air plan instead of just
     # describing it.
     _GUIDANCE: ClassVar[Mapping[str, str]] = {
         ThreatCategory.ENEMY_AIRCRAFT.value: (
-            "enemy aircraft -- clear the area with fighter sweeps/CAP before you "
-            "strike, and escort every striker"
+            "enemy aircraft -- fighter sweeps/CAP first, escort every striker"
         ),
         ThreatCategory.GROUND_SAM.value: (
-            "ground SAMs -- suppress them with SEAD/DEAD before overflying"
+            "ground SAMs -- suppress with SEAD/DEAD before overflying"
         ),
         ThreatCategory.NAVAL.value: (
-            "ships -- suppress with SEAD/anti-ship or stay out of their range"
+            "ships -- suppress with SEAD/anti-ship or stay clear"
+        ),
+    }
+
+    # Directive for each threat that killed RED *ground* units. Ground losses need
+    # a different response from air losses: contest the air over the front, or
+    # mass heavier armour, depending on what did the killing.
+    _GROUND_GUIDANCE: ClassVar[Mapping[str, str]] = {
+        ThreatCategory.ENEMY_AIRCRAFT.value: (
+            "ground lost to enemy air -- add AAA/SAM/SHORAD cover and contest the air"
+        ),
+        ThreatCategory.GROUND_FIRE.value: (
+            "ground lost to fire -- mass heavier armour/anti-armour to advance"
         ),
     }
 
     def _render_guidance(self) -> str:
-        """One line tying the dominant loss causes to next-turn behaviour."""
+        """One line tying the dominant loss causes to next-turn behaviour.
 
-        causes: set[str] = set()
-        for by_cause in (
-            self.red_aircraft_lost_by_cause,
-            self.red_ground_units_lost_by_cause,
-        ):
-            causes.update(k for k, v in by_cause.items() if v > 0)
-        directives = [
-            self._GUIDANCE[category.value]
-            for category in ThreatCategory
-            if category.value in self._GUIDANCE and category.value in causes
-        ]
+        Air losses and ground losses are read separately: an aircraft downed by
+        enemy fighters calls for air superiority, whereas a tank killed by enemy
+        air calls for SHORAD at the front. Read the after-action every turn and
+        adapt the buy and the plan to what is actually killing your forces.
+        """
+
+        directives: list[str] = []
+        air_causes = {k for k, v in self.red_aircraft_lost_by_cause.items() if v > 0}
+        ground_causes = {
+            k for k, v in self.red_ground_units_lost_by_cause.items() if v > 0
+        }
+        for category in ThreatCategory:
+            if category.value in self._GUIDANCE and category.value in air_causes:
+                directives.append(self._GUIDANCE[category.value])
+        for category in ThreatCategory:
+            if (
+                category.value in self._GROUND_GUIDANCE
+                and category.value in ground_causes
+            ):
+                directives.append(self._GROUND_GUIDANCE[category.value])
         if not directives:
             return ""
         return "next_turn: " + "; ".join(directives) + "."

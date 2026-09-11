@@ -19,13 +19,56 @@ from typing import cast
 
 import pytest
 
-from game.ai_commander.enums import IntelPolicy
+from game.ai_commander.enums import IntelPolicy, TargetSetCategory
 from game.ai_commander.operations import (
     OPERATIONS_SCHEMA_VERSION,
     OperationsBrief,
     OperationsProjector,
+    TargetView,
 )
 from tests.ai_commander import fakes
+
+
+class _FakeObjective:
+    def __init__(self, category: str) -> None:
+        self.category = category
+
+
+class TestEnemyTargetIncomeTag:
+    """Income-generating enemy buildings carry their generic per-turn value so a
+    deep strike on a derrick/oil rig reads as high value, not filler."""
+
+    def _target(self, category: TargetSetCategory, income: float | None) -> TargetView:
+        return TargetView(
+            id="TGT-1",
+            category=category,
+            label="derrick",
+            near="BASE-1",
+            threatens_own_forces=False,
+            legal_missions=("Strike",),
+            income_value=income,
+        )
+
+    def test_income_building_target_is_tagged(self) -> None:
+        rendered = self._target(TargetSetCategory.ENEMY_INFRASTRUCTURE, 10).render()
+        assert "income~10/turn" in rendered
+
+    def test_non_income_target_has_no_tag(self) -> None:
+        rendered = self._target(TargetSetCategory.ENEMY_MOTORPOOLS, None).render()
+        assert "income~" not in rendered
+
+    def test_zero_income_has_no_tag(self) -> None:
+        rendered = self._target(TargetSetCategory.ENEMY_INFRASTRUCTURE, 0).render()
+        assert "income~" not in rendered
+
+    def test_income_derived_from_rewards_by_category(self) -> None:
+        # Only categories in the REWARDS table earn a value; others get None.
+        assert OperationsProjector._target_income(_FakeObjective("derrick")) == 8.0
+        assert OperationsProjector._target_income(_FakeObjective("oil")) == 10.0
+        assert OperationsProjector._target_income(_FakeObjective("factory")) == 2.5
+        assert OperationsProjector._target_income(_FakeObjective("ammo")) == 2.0
+        assert OperationsProjector._target_income(_FakeObjective("motorpool")) is None
+        assert OperationsProjector._target_income(_FakeObjective("")) is None
 
 
 @pytest.fixture(autouse=True)

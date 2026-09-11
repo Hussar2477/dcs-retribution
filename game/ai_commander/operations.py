@@ -155,6 +155,10 @@ class BaseView:
     can_recruit_ground_units: bool
     has_ground_unit_source: bool
     squadron_ids: tuple[str, ...]
+    #: This base's own income per turn (the control point plus any income-
+    #: generating buildings on it), so the model can see that its budget has a
+    #: physical, defendable source. ``None`` when it could not be computed.
+    income_per_turn: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return jsonable(self)
@@ -187,6 +191,8 @@ class BaseView:
         ground_types = self._render_ground_types()
         if ground_types:
             parts.append(f"ground_types: {ground_types}")
+        if self.income_per_turn is not None and self.income_per_turn > 0:
+            parts.append(f"income={self.income_per_turn:g}/turn")
         if self.parking_free is not None:
             parts.append(f"parking_free={self.parking_free}")
         if not self.runway_operational:
@@ -266,6 +272,12 @@ class TargetView:
     threatens_own_forces: bool
     legal_missions: tuple[str, ...]
     notes: str = ""
+    #: Generic income per turn this objective earns its owner, from the REWARDS
+    #: table by category (oil/derrick/factory/fuel/ammo/warehouse/farp). Set only
+    #: for income-generating buildings so the model can see that striking a
+    #: derrick or oil rig is a high-value deep strike that starves the enemy
+    #: budget. ``None`` for categories that generate no income.
+    income_value: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return jsonable(self)
@@ -273,10 +285,15 @@ class TargetView:
     def render(self) -> str:
         missions = ",".join(self.legal_missions) or "none"
         threat = " | threatens_own_forces" if self.threatens_own_forces else ""
+        income = (
+            f" | income~{self.income_value:g}/turn"
+            if self.income_value is not None and self.income_value > 0
+            else ""
+        )
         note = f" | {self.notes}" if self.notes else ""
         return (
             f"{self.id} | {self.category.value} | {self.label} | near={self.near} "
-            f"| missions={missions}{threat}{note}"
+            f"| missions={missions}{threat}{income}{note}"
         )
 
 
@@ -633,6 +650,7 @@ class OperationsProjector:
                         )
                     ),
                     squadron_ids=tuple(squadron_id_list),
+                    income_per_turn=self._base_income(control_point),
                 )
             )
             self.resolver.bases[base_id] = control_point
@@ -685,6 +703,32 @@ class OperationsProjector:
             return None
         value = getattr(status, "repair_turns_remaining", None)
         return value if isinstance(value, int) else None
+
+    def _base_income(self, control_point: Any) -> Optional[float]:
+        """This base's own income per turn: the control point plus its income-
+        generating buildings (oil/derrick/factory/fuel/ammo/warehouse), scaled by
+        RED's income multiplier. Mirrors :class:`game.income.Income` so the figure
+        the model sees matches the budget it actually earns. RED-only.
+        """
+
+        from game.config import REWARDS
+
+        try:
+            base = float(getattr(control_point, "income_per_turn", 0) or 0)
+            buildings = 0.0
+            for tgo in getattr(control_point, "ground_objects", []) or []:
+                category = getattr(tgo, "category", None)
+                if category not in REWARDS:
+                    continue
+                alive = sum(1 for b in getattr(tgo, "statics", []) if b.alive)
+                buildings += alive * REWARDS[category]
+            multiplier = float(
+                getattr(self.game.settings, "enemy_income_multiplier", 1.0)
+            )
+            return round((base + buildings) * multiplier, 2)
+        except Exception:  # pragma: no cover - defensive
+            logging.debug("Base income computation failed", exc_info=True)
+            return None
 
     def _project_squadrons(
         self, base_ids: dict[int, str], squadron_ids: dict[int, str]
@@ -845,9 +889,26 @@ class OperationsProjector:
                     threatens_own_forces=category in _THREATENING_CATEGORIES,
                     legal_missions=tuple(sorted(m.value for m in missions)),
                     notes=note,
+                    income_value=self._target_income(objective),
                 )
             )
         return tuple(views), max(0, len(ranked) - len(views))
+
+    @staticmethod
+    def _target_income(objective: Any) -> Optional[float]:
+        """Generic per-turn income for an income-generating enemy building, from
+        the REWARDS table by category. Only categories present in REWARDS get a
+        value; everything else returns ``None``. This adds no new intelligence --
+        the target is already identified and shown to RED; only the generic
+        income-per-category figure is attached.
+        """
+
+        from game.config import REWARDS
+
+        category = getattr(objective, "category", None)
+        if not isinstance(category, str) or category not in REWARDS:
+            return None
+        return float(REWARDS[category])
 
     @staticmethod
     def _closest_own_distance(position: Any, own: Sequence[Any]) -> Optional[int]:

@@ -61,6 +61,17 @@ class TestLogisticsBriefing:
         assert "destination_base_id" in text
         assert "retreat" in text
 
+    def test_force_mix_composition_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Break through with armour/anti-armour; survive enemy air with SHORAD.
+        assert "FORCE MIX" in text
+        assert "anti-armour" in text
+        assert "SHORAD" in text
+
+    def test_holding_and_advancing_gains_income_is_stated(self) -> None:
+        text = self._text()
+        assert "income buildings" in text
+
 
 class TestCommandBriefing:
     def _text(self) -> str:
@@ -73,3 +84,14 @@ class TestCommandBriefing:
 
     def test_recent_turns_repetition_reminder_is_stated(self) -> None:
         assert "RECENT TURNS" in self._text()
+
+    def test_economic_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Money sustains the war: protect own income, strike the enemy's.
+        assert "ECONOMY" in text
+        assert "income buildings" in text
+        assert "future income" in text or "future budget" in text
+
+    def test_capturing_territory_gains_income_is_stated(self) -> None:
+        text = self._text()
+        assert "Capturing enemy territory" in text
