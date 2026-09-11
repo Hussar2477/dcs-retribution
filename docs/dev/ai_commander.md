@@ -442,6 +442,51 @@ How it stays fair and cheap:
   alongside classification, attribution, serialization round-trip, garbage
   tolerance and the render length bound.
 
+### 4.7 Playing better: doctrine, adaptation and legality reinforcement
+
+A live campaign showed an opponent that emitted clean decisions but played
+badly and repetitively — losing air exchanges, flying strikers back into
+contested airspace, requesting fighter missions on illegal targets, over-
+investing a front it could not hold, transferring ground units a base did not
+own, and running the same losing plan turn after turn. These changes push the
+model toward better play, all while staying strictly inside the fairness
+boundary (everything added is RED's own observable state or its own past
+decisions):
+
+* **Air superiority first (stage-3 briefing, `activeprompt.py`).** The
+  air-tasking briefing now carries an explicit doctrine: if the after-action
+  report shows aircraft lost to enemy aircraft, lead with fighter sweeps or CAP
+  to clear the target area *before* committing strikers rather than interleaving
+  lone strikers with fighters, and give every strike, OCA and anti-ship package
+  a genuine Escort (plus SEAD / SEAD Escort when SAMs or ships are the killer).
+* **Sharper mission-type rules (stage-3 briefing).** A one-line gloss of what
+  each fighter mission is *for* (BARCAP/TARCAP patrol an area and cannot strike;
+  Fighter sweep clears enemy fighters; Escort protects a strike; SEAD / SEAD
+  Escort suppress SAMs) sits alongside the two legality rules already restated
+  there (a flight's `mission_type` must be in the target's briefed `missions=`
+  list; each `target_id` in at most one package).
+* **Actionable after-action (`debrief.py`).** `render_compact()` now ends with a
+  `next_turn:` line keyed off the dominant loss causes — enemy aircraft ⇒ clear
+  with sweeps/CAP and escort strikers; ground SAMs ⇒ suppress with SEAD/DEAD;
+  ships ⇒ suppress with SEAD/anti-ship or stay out of range — so the debrief
+  drives the next plan instead of merely describing the last one. It is omitted
+  when no cause is actionable, and the whole block stays under the length bound.
+* **Ground inventory by unit type (`operations.py` + stage-2 briefing).** Each
+  base line now lists its present ground stock broken down by unit type
+  (`ground_types: T-72B x8, BMP-2 x4 (+3 further types)`), truncated to the top
+  few types with the remainder summarised. The logistics briefing tells the
+  model to transfer only types a base actually holds, to consolidate every move
+  to a base into a single transfer object (never repeating a
+  `destination_base_id`), and not to pour reinforcements into a front it cannot
+  hold.
+* **Posture legality and anti-repetition (`activeprompt.py` + `intel.py`).** The
+  command-intent briefing reinforces that each front's posture must be chosen
+  from that front's own `legal=` set. A new `[RECENT TURNS]` block summarises the
+  last few decided turns (strategy, reserve policy, priorities, rejected count,
+  fallback — most recent first, sourced from `AuditLog.recent_summaries`) so the
+  model can notice when it keeps repeating an approach that is not working and
+  change it.
+
 ## 5. What `REALISTIC` withholds versus `FULL_PARITY`
 
 Two intel policies are selectable in the settings UI
@@ -889,12 +934,14 @@ campaign entirely out of stubs — no DCS, no mission files, no network:
 | `test_cost_cap.py` | Ledger arithmetic, refusal before sending when the worst-case reserve exceeds the cap, reserve/release/settle, and that the controller falls back instead of raising. |
 | `test_fallback.py` | Transport error, HTTP error, timeout, repeatedly malformed output, unexpected exception — every one ends in the deterministic fallback so a turn never breaks. |
 | `test_secrets_and_audit.py` | Key masking and redaction, that the key is absent from configs/records/reprs, audit record shape, per-turn cost accounting, and the replay guard. |
-| `test_debrief.py` | The after-action summary (§4.6): `classify_threat` mapping, cause attribution and the `UNKNOWN` remainder bucket, RED-perspective loss/kill counting, serialization round-trip and garbage tolerance, the `render_compact` length bound, and — same as `test_intel_leak.py` — that the rendered block leaks no BLUE information. |
+| `test_debrief.py` | The after-action summary (§4.6, §4.7): `classify_threat` mapping, cause attribution and the `UNKNOWN` remainder bucket, RED-perspective loss/kill counting, serialization round-trip and garbage tolerance, the `render_compact` length bound, the actionable `next_turn:` guidance keyed off dominant loss causes (present when actionable, absent otherwise), and — same as `test_intel_leak.py` — that the rendered block leaks no BLUE information. |
 | `test_llmclient.py` | The transport client: the reasoning soft-cap formula and its ceiling, the anti-repetition penalties sent by default and their configurability, and truncation detection (`was_truncated` on `finish_reason` of `length`; `looks_truncated` when an empty answer follows a reasoning channel that consumed most of the budget). |
 | `test_truncation_repair.py` | Truncation-aware repair: a cut-off first reply enlarges the single repair's output budget; an empty-but-reasoning-exhausted reply is treated the same; an ordinary schema error keeps the normal budget; the enlargement clamps to the 32000 ceiling; and the audit note distinguishes the cut-off case from a schema failure. |
 | `test_capture_awareness.py` | Front-line and base-capture awareness (§4.1): the misleading "cannot capture bases" wording is gone, the indirect-capture chain and every posture are explained, per-front `capture_status` reports `available` / `needs force advantage` / `blocked (N …)` correctly, and the rendered status carries no BLUE-leak sentinels. |
 | `test_on_order_notation.py` | The on-order rendering (§4.6): the force summary (`intel.py`) and the base and squadron lines (`operations.py`) omit the on-order count when it is zero and label it `on_order=N` when positive — never the old delta-like `(+N)`. |
-| `test_air_tasking_prompt.py` | The stage-3 air-tasking briefing restates the two legality rules the model broke live: a flight's `mission_type` must be in the target's briefed `missions=` list (only Escort / SEAD Escort may be added), and each `target_id` may appear in at most one package. |
+| `test_air_tasking_prompt.py` | The stage briefings (§4.7): the stage-3 air-tasking briefing restates the two legality rules the model broke live (a flight's `mission_type` must be in the target's briefed `missions=` list, only Escort / SEAD Escort added; each `target_id` in at most one package), states the air-superiority-first doctrine and explains what each fighter mission is for; the stage-2 logistics briefing states the ground-transfer rules (only types a base holds, one transfer per `destination_base_id`, don't over-invest a losing front); and the stage-1 command briefing reinforces posture legality and the recent-turns repetition check. |
+| `test_ground_inventory.py` | The per-base ground inventory by unit type (§4.7): `BaseView.render` lists present stock as `ground_types: <type> x<n>` ordered by quantity, summarises the remainder as `(+N further types)`, omits the note when nothing is truncated, and omits the field entirely for an empty inventory. |
+| `test_recent_turns.py` | The `[RECENT TURNS]` history block (§4.7): it renders when several decided turns are known (newest first, with the repetition reminder), is absent with one or no prior turns, and — sourced only from RED's own past decisions — leaks no BLUE information. |
 
 The ACTIVE-mode suite adds:
 

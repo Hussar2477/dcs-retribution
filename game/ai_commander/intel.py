@@ -216,6 +216,10 @@ class RedCommanderBrief:
     commander_constraints: CommanderConstraints
     prior_decision_summary: PriorTurnSummary
     prior_outcome_summary: PriorTurnSummary
+    #: A few most-recent decided turns (most recent first) so the model can see
+    #: whether it is repeating an approach that is not working. RED's own past
+    #: decisions only -- no BLUE information.
+    recent_turn_summaries: tuple[PriorTurnSummary, ...] = ()
     withheld_fields: tuple[str, ...] = field(default_factory=tuple)
     #: Fair, RED-perspective debrief of the last resolved mission (own losses
     #: attributed to their causes, plus confirmed BLUE losses). None on the very
@@ -378,6 +382,28 @@ class RedCommanderBrief:
             "still block it.",
         ]
 
+        recent = [s for s in self.recent_turn_summaries if s.turn is not None]
+        if len(recent) > 1:
+            lines += ["", "[RECENT TURNS]"]
+            lines.append(
+                "Your last few decisions, newest first. If the same strategy and "
+                "priorities keep recurring while you keep losing forces, change "
+                "your approach."
+            )
+            for entry in recent:
+                priorities = (
+                    " > ".join(entry.target_set_order[:3])
+                    if entry.target_set_order
+                    else "none"
+                )
+                lines.append(
+                    f"turn={entry.turn} strategy={entry.strategy} "
+                    f"reserve={entry.reserve_policy} "
+                    f"priorities={priorities} "
+                    f"rejected={entry.rejected_element_count} "
+                    f"fallback={entry.fallback_reason or 'none'}"
+                )
+
         prior = self.prior_decision_summary
         if prior.turn is not None:
             lines += ["", "[LAST TURN]"]
@@ -494,6 +520,7 @@ class IntelProjector:
         self,
         prior_decision: Optional[PriorTurnSummary] = None,
         prior_outcome: Optional[PriorTurnSummary] = None,
+        recent_decisions: tuple[PriorTurnSummary, ...] = (),
     ) -> RedCommanderBrief:
         fronts = self._project_fronts()
         target_sets = self._project_target_sets(fronts)
@@ -514,6 +541,7 @@ class IntelProjector:
             commander_constraints=CommanderConstraints.default(),
             prior_decision_summary=prior_decision or PriorTurnSummary(),
             prior_outcome_summary=prior_outcome or PriorTurnSummary(),
+            recent_turn_summaries=recent_decisions,
             withheld_fields=(
                 REALISTIC_WITHHELD_FIELDS
                 if self.policy is IntelPolicy.REALISTIC

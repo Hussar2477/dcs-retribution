@@ -537,6 +537,27 @@ class AuditLog:
             return summary_from_payload(records[-1])
         return None
 
+    def recent_summaries(
+        self, campaign_id_hash: str, before_turn: int, limit: int = 3
+    ) -> tuple[PriorTurnSummary, ...]:
+        """Summaries of the last ``limit`` decided turns, most recent first.
+
+        Lets the brief show a few turns of history so the model can notice a
+        losing approach it keeps repeating and change it.
+        """
+
+        summaries: list[PriorTurnSummary] = []
+        for turn_id in reversed(self.turns(campaign_id_hash)):
+            if turn_id >= before_turn:
+                continue
+            records = self.records_for_turn(campaign_id_hash, turn_id)
+            if not records:
+                continue
+            summaries.append(summary_from_payload(records[-1]))
+            if len(summaries) >= limit:
+                break
+        return tuple(summaries)
+
     # -- UI support -------------------------------------------------------
 
     def all_records(self, campaign_id_hash: str) -> list[dict[str, Any]]:

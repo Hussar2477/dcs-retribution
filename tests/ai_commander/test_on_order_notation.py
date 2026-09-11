@@ -92,6 +92,8 @@ def _base(aircraft_on_order: int, ground_units_on_order: int) -> BaseView:
         parking_free=None,
         ground_units_present=85,
         ground_units_on_order=ground_units_on_order,
+        ground_units_by_type=(),
+        ground_types_truncated=0,
         can_recruit_ground_units=True,
         has_ground_unit_source=True,
         squadron_ids=(),

@@ -57,6 +57,11 @@ MAX_ENUMERATED_TARGETS = 40
 MAX_ENUMERATED_BASES = 40
 MAX_ENUMERATED_SQUADRONS = 40
 
+#: How many ground-unit types to list per base before summarising the rest. The model
+#: only needs to know which types are present so it does not try to transfer units a
+#: base does not hold; the top few by quantity carry that, and the remainder is noted.
+MAX_ENUMERATED_GROUND_TYPES = 4
+
 #: Mission types the commander may request in an ACTIVE air tasking order. Deliberately
 #: excludes the mission families Retribution plans for itself or that make no sense
 #: under commander control (ferry flights, Pretense cargo, recovery tankers).
@@ -142,12 +147,27 @@ class BaseView:
     parking_free: Optional[int]
     ground_units_present: int
     ground_units_on_order: int
+    #: Present ground inventory broken down by unit type, ordered by quantity
+    #: descending. Truncated to the top types; the remainder is summarised so the
+    #: model transfers only unit types the base actually holds.
+    ground_units_by_type: tuple[tuple[str, int], ...]
+    ground_types_truncated: int
     can_recruit_ground_units: bool
     has_ground_unit_source: bool
     squadron_ids: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return jsonable(self)
+
+    def _render_ground_types(self) -> str:
+        if not self.ground_units_by_type:
+            return ""
+        listed = ", ".join(
+            f"{name} x{count}" for name, count in self.ground_units_by_type
+        )
+        if self.ground_types_truncated:
+            listed += f" (+{self.ground_types_truncated} further types)"
+        return listed
 
     def render(self) -> str:
         aircraft_on_order = (
@@ -164,6 +184,9 @@ class BaseView:
             f"aircraft={self.aircraft_present}{aircraft_on_order}",
             f"ground={self.ground_units_present}{ground_on_order}",
         ]
+        ground_types = self._render_ground_types()
+        if ground_types:
+            parts.append(f"ground_types: {ground_types}")
         if self.parking_free is not None:
             parts.append(f"parking_free={self.parking_free}")
         if not self.runway_operational:
@@ -546,12 +569,26 @@ class OperationsProjector:
 
             ground_present = 0
             ground_ordered = 0
+            ground_by_type: tuple[tuple[str, int], ...] = ()
+            ground_types_truncated = 0
             try:
                 ground = control_point.allocated_ground_units(
                     self._coalition().transfers
                 )
                 ground_present = int(ground.total_present)
                 ground_ordered = int(ground.total_ordered)
+                ranked = sorted(
+                    (
+                        (str(unit_type), int(count))
+                        for unit_type, count in ground.present.items()
+                        if count > 0
+                    ),
+                    key=lambda item: (-item[1], item[0]),
+                )
+                ground_by_type = tuple(ranked[:MAX_ENUMERATED_GROUND_TYPES])
+                ground_types_truncated = max(
+                    0, len(ranked) - MAX_ENUMERATED_GROUND_TYPES
+                )
             except Exception:  # pragma: no cover - defensive
                 logging.debug("Ground allocation failed", exc_info=True)
 
@@ -587,6 +624,8 @@ class OperationsProjector:
                     parking_free=parking_free,
                     ground_units_present=ground_present,
                     ground_units_on_order=ground_ordered,
+                    ground_units_by_type=ground_by_type,
+                    ground_types_truncated=ground_types_truncated,
                     can_recruit_ground_units=self._can_recruit(control_point),
                     has_ground_unit_source=bool(
                         self._call_bool_with_game(

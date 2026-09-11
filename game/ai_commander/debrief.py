@@ -31,7 +31,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, unique
-from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Dict, Mapping, Optional, TYPE_CHECKING
 
 from game.data.units import UnitClass
 
@@ -291,6 +291,40 @@ class DebriefSummary:
                 parts.append(f"{category.label}={count}")
         return ", ".join(parts)
 
+    # Short, actionable directive for each threat that killed something this
+    # turn, so the after-action drives next turn's plan instead of just
+    # describing it.
+    _GUIDANCE: ClassVar[Mapping[str, str]] = {
+        ThreatCategory.ENEMY_AIRCRAFT.value: (
+            "enemy aircraft -- clear the area with fighter sweeps/CAP before you "
+            "strike, and escort every striker"
+        ),
+        ThreatCategory.GROUND_SAM.value: (
+            "ground SAMs -- suppress them with SEAD/DEAD before overflying"
+        ),
+        ThreatCategory.NAVAL.value: (
+            "ships -- suppress with SEAD/anti-ship or stay out of their range"
+        ),
+    }
+
+    def _render_guidance(self) -> str:
+        """One line tying the dominant loss causes to next-turn behaviour."""
+
+        causes: set[str] = set()
+        for by_cause in (
+            self.red_aircraft_lost_by_cause,
+            self.red_ground_units_lost_by_cause,
+        ):
+            causes.update(k for k, v in by_cause.items() if v > 0)
+        directives = [
+            self._GUIDANCE[category.value]
+            for category in ThreatCategory
+            if category.value in self._GUIDANCE and category.value in causes
+        ]
+        if not directives:
+            return ""
+        return "next_turn: " + "; ".join(directives) + "."
+
     def render_compact(self) -> str:
         """A short plain-text block for the prompt. Empty string if nothing to say."""
 
@@ -349,6 +383,10 @@ class DebriefSummary:
             kills.append(f"bases_captured={self.blue_bases_captured}")
         if kills:
             lines.append("confirmed_enemy_losses: " + ", ".join(kills))
+
+        guidance = self._render_guidance()
+        if guidance:
+            lines.append(guidance)
 
         return "\n".join(lines)
 

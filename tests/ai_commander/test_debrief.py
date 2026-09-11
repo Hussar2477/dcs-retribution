@@ -378,6 +378,35 @@ class TestRenderingAndSerialisation:
         # A whole after-action block should stay small (token budget guard).
         assert len(self._summary().render_compact()) < 600
 
+    def test_actionable_guidance_keyed_off_loss_causes(self) -> None:
+        # The summary lost aircraft to enemy aircraft and to ships, so both
+        # directives should appear, tying the losses to next-turn behaviour.
+        rendered = self._summary().render_compact()
+        assert "next_turn:" in rendered
+        assert "fighter sweeps/CAP" in rendered
+        assert "escort every striker" in rendered
+        assert "ships -- suppress" in rendered
+
+    def test_ground_sam_guidance_appears_for_sam_losses(self) -> None:
+        summary = DebriefSummary(
+            turn=5,
+            red_aircraft_lost=1,
+            red_aircraft_lost_by_cause={"ground_sam": 1},
+        )
+        assert "SEAD/DEAD" in summary.render_compact()
+
+    def test_no_guidance_when_causes_are_not_actionable(self) -> None:
+        # Losses only to ground fire / unknown carry no air-tasking directive.
+        summary = DebriefSummary(
+            turn=5,
+            red_ground_units_lost=2,
+            red_ground_units_lost_by_cause={"ground_fire": 2},
+        )
+        assert "next_turn:" not in summary.render_compact()
+
+    def test_no_guidance_on_a_quiet_turn(self) -> None:
+        assert "next_turn:" not in DebriefSummary(turn=4).render_compact()
+
     def test_round_trips_through_dict(self) -> None:
         summary = self._summary()
         assert DebriefSummary.from_dict(summary.to_dict()) == summary

@@ -56,7 +56,11 @@ from game.ai_commander.decision import (
 from game.ai_commander.directive import CommanderDirective
 from game.ai_commander.enums import CommanderMode, FallbackReason
 from game.ai_commander.execution import task_order_for
-from game.ai_commander.intel import IntelProjector, RedCommanderBrief
+from game.ai_commander.intel import (
+    IntelProjector,
+    PriorTurnSummary,
+    RedCommanderBrief,
+)
 from game.ai_commander.legality import LegalityChecker
 from game.ai_commander.operations import (
     OperationsBrief,
@@ -830,11 +834,15 @@ class RedCommanderTurn:
     def _project_brief(self) -> RedCommanderBrief:
         projector = IntelProjector(self.game, self.config.intel_policy)
         prior = None
+        recent: tuple[PriorTurnSummary, ...] = ()
         if self.audit_log is not None:
             prior = self.audit_log.latest_summary(
                 projector.campaign_id_hash(), int(self.game.turn)
             )
-        return projector.project(prior_decision=prior)
+            recent = self.audit_log.recent_summaries(
+                projector.campaign_id_hash(), int(self.game.turn)
+            )
+        return projector.project(prior_decision=prior, recent_decisions=recent)
 
     def _start_record(self, brief: RedCommanderBrief) -> None:
         record = self.record

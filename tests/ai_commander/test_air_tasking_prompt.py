@@ -33,3 +33,43 @@ class TestAirTaskingBriefing:
     def test_other_stages_do_not_carry_the_reminder(self) -> None:
         for stage in (CommanderStage.COMMAND, CommanderStage.LOGISTICS):
             assert "at most one package" not in stage_briefing_text(stage)
+
+    def test_air_superiority_first_doctrine_is_stated(self) -> None:
+        text = self._text().lower()
+        # Win the air before committing strikers, escort every striker.
+        assert "sweep" in text
+        assert "escort" in text
+        assert "only then commit strikers" in text
+        assert "air superiority" in text
+
+    def test_mission_type_purposes_are_explained(self) -> None:
+        text = self._text()
+        # A short gloss of what the fighter missions are actually for.
+        assert "BARCAP" in text
+        assert "Fighter sweep" in text
+        assert "SEAD" in text
+
+
+class TestLogisticsBriefing:
+    def _text(self) -> str:
+        return stage_briefing_text(CommanderStage.LOGISTICS)
+
+    def test_ground_transfer_rules_are_stated(self) -> None:
+        text = self._text()
+        # Only transfer types a base holds, and never duplicate a destination.
+        assert "ground_types" in text
+        assert "destination_base_id" in text
+        assert "retreat" in text
+
+
+class TestCommandBriefing:
+    def _text(self) -> str:
+        return stage_briefing_text(CommanderStage.COMMAND)
+
+    def test_posture_legality_reminder_is_stated(self) -> None:
+        text = self._text()
+        assert "legal=" in text
+        assert "retreat" in text
+
+    def test_recent_turns_repetition_reminder_is_stated(self) -> None:
+        assert "RECENT TURNS" in self._text()
