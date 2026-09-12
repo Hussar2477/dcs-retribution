@@ -524,6 +524,45 @@ passes).
   fire ⇒ mass heavier armour/anti-armour before advancing. The whole block still
   stays under the length bound.
 
+### 4.9 Front-line air, production and thinking like a commander
+
+A further doctrine-only pass (all in `activeprompt.py`, no new game data) rounds
+out how the opponent uses the toolbox it already has. It is RED's own doctrine
+plus references to already-identified enemy targets, so `test_intel_leak.py`
+still passes.
+
+* **Front-line air protection and close air support (air-tasking stage).** Once
+  the air is contestable, the stage-3 briefing directs the model to fly CAP
+  (BARCAP/TARCAP) over a front to shield friendly ground and rear areas from
+  enemy aircraft — especially when the after-action shows ground lost to enemy
+  air — and to use CAS and BAI at the front to defend its own ground units and
+  break up the enemy's. Because CAS/BAI flights are themselves vulnerable
+  strikers, the doctrine insists they be given a fighter Escort and overlapping
+  CAP. This is tied to the existing air-superiority-first rule: contest the air,
+  then support the ground.
+* **Factories produce ground units (command + logistics stages).** The
+  command-intent briefing gains a `PRODUCTION` paragraph: factories both earn
+  income and let a base build ground units (a base recruits ground units only
+  where it has a working factory, which is why `[OWN BASES]` shows
+  `recruit_ground=yes`/`no`), so own factories must be protected and an enemy
+  factory (`enemy_infrastructure 'factory'`, `missions=Strike`) is a prime
+  deep-strike target that starves the enemy budget *and* stops their ground
+  production. The logistics briefing restates that ground units can only be built
+  at a base with a working factory. This matches
+  `ControlPoint.has_factory` → `can_recruit_ground_units`.
+* **Runway strikes (air-tasking stage).** A `RUNWAY STRIKES` paragraph teaches
+  that `OCA/Runway` against an `enemy_airbases` target (whose `missions=` lists
+  it) takes that airbase out of action for a while and grounds the aircraft based
+  there — a way to cut enemy air pressure without winning every dogfight, to be
+  weighed alongside `OCA/Aircraft` and fighter sweeps.
+* **Think like a human commander (command-intent stage).** A short
+  `COMMANDER'S ART` paragraph reminds the model that it holds a full toolbox —
+  air superiority, CAP over the front, CAS/BAI for the ground battle, deep
+  strikes on income and production, runway strikes to ground enemy air, SEAD/DEAD
+  ahead of strikers, and capturing territory for its income — and should combine
+  them into one coherent plan and adapt every turn to the after-action results
+  rather than repeating the same moves.
+
 ## 5. What `REALISTIC` withholds versus `FULL_PARITY`
 
 Two intel policies are selectable in the settings UI
@@ -976,7 +1015,7 @@ campaign entirely out of stubs — no DCS, no mission files, no network:
 | `test_truncation_repair.py` | Truncation-aware repair: a cut-off first reply enlarges the single repair's output budget; an empty-but-reasoning-exhausted reply is treated the same; an ordinary schema error keeps the normal budget; the enlargement clamps to the 32000 ceiling; and the audit note distinguishes the cut-off case from a schema failure. |
 | `test_capture_awareness.py` | Front-line and base-capture awareness (§4.1): the misleading "cannot capture bases" wording is gone, the indirect-capture chain and every posture are explained, per-front `capture_status` reports `available` / `needs force advantage` / `blocked (N …)` correctly, and the rendered status carries no BLUE-leak sentinels. |
 | `test_on_order_notation.py` | The on-order rendering (§4.6): the force summary (`intel.py`) and the base and squadron lines (`operations.py`) omit the on-order count when it is zero and label it `on_order=N` when positive — never the old delta-like `(+N)`. |
-| `test_air_tasking_prompt.py` | The stage briefings (§4.7): the stage-3 air-tasking briefing restates the two legality rules the model broke live (a flight's `mission_type` must be in the target's briefed `missions=` list, only Escort / SEAD Escort added; each `target_id` in at most one package), states the air-superiority-first doctrine and explains what each fighter mission is for; the stage-2 logistics briefing states the ground-transfer rules (only types a base holds, one transfer per `destination_base_id`, don't over-invest a losing front) plus the `FORCE MIX` composition doctrine (armour/anti-armour to break through, AAA/SAM/SHORAD for air cover) and the hold/advance-for-income point; and the stage-1 command briefing reinforces posture legality, the recent-turns repetition check and the economic doctrine (§4.8: protect own income, strike the enemy's, capture gains income buildings). |
+| `test_air_tasking_prompt.py` | The stage briefings (§4.7–§4.9): the stage-3 air-tasking briefing restates the two legality rules the model broke live (a flight's `mission_type` must be in the target's briefed `missions=` list, only Escort / SEAD Escort added; each `target_id` in at most one package), states the air-superiority-first doctrine, explains what each fighter mission is for, and (§4.9) states the front-line air doctrine (CAP over a front, CAS/BAI for the ground battle, escort the vulnerable strikers) and the runway-strike doctrine (`OCA/Runway` grounds an enemy airbase); the stage-2 logistics briefing states the ground-transfer rules (only types a base holds, one transfer per `destination_base_id`, don't over-invest a losing front), the `FORCE MIX` composition doctrine (armour/anti-armour to break through, AAA/SAM/SHORAD for air cover), the hold/advance-for-income point and (§4.9) the factory/`recruit_ground=` build requirement; and the stage-1 command briefing reinforces posture legality, the recent-turns repetition check, the economic doctrine (§4.8: protect own income, strike the enemy's, capture gains income buildings) and (§4.9) the `PRODUCTION` factory doctrine and the `COMMANDER'S ART` toolbox/adapt paragraph — the last two confined to stage 1. |
 | `test_ground_inventory.py` | The per-base ground inventory by unit type (§4.7) and per-base income (§4.8): `BaseView.render` lists present stock as `ground_types: <type> x<n>` ordered by quantity, summarises the remainder as `(+N further types)`, omits the note when nothing is truncated, omits the field entirely for an empty inventory, and shows `income=N/turn` when positive (compact for fractional values) while omitting it when `None` or zero. |
 | `test_recent_turns.py` | The `[RECENT TURNS]` history block (§4.7): it renders when several decided turns are known (newest first, with the repetition reminder), is absent with one or no prior turns, and — sourced only from RED's own past decisions — leaks no BLUE information. |
 

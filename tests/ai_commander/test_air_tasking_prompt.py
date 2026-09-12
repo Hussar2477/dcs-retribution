@@ -49,6 +49,22 @@ class TestAirTaskingBriefing:
         assert "Fighter sweep" in text
         assert "SEAD" in text
 
+    def test_front_line_air_support_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # CAP over the front, CAS/BAI for the ground battle, escort the strikers.
+        assert "FRONT-LINE AIR" in text
+        assert "CAS" in text
+        assert "BAI" in text
+        assert "Escort" in text
+        assert "ground lost to enemy air" in text
+
+    def test_runway_strike_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Crater runways to ground enemy aircraft.
+        assert "RUNWAY STRIKES" in text
+        assert "OCA/Runway" in text
+        assert "enemy_airbases" in text
+
 
 class TestLogisticsBriefing:
     def _text(self) -> str:
@@ -71,6 +87,12 @@ class TestLogisticsBriefing:
     def test_holding_and_advancing_gains_income_is_stated(self) -> None:
         text = self._text()
         assert "income buildings" in text
+
+    def test_factory_recruit_link_is_stated(self) -> None:
+        text = self._text()
+        # Ground units can only be built where a factory stands.
+        assert "factory" in text
+        assert "recruit_ground=" in text
 
 
 class TestCommandBriefing:
@@ -95,3 +117,23 @@ class TestCommandBriefing:
     def test_capturing_territory_gains_income_is_stated(self) -> None:
         text = self._text()
         assert "Capturing enemy territory" in text
+
+    def test_factory_production_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Factories both earn income and enable ground-unit production.
+        assert "PRODUCTION" in text
+        assert "recruit_ground=yes" in text
+        assert "factory" in text
+
+    def test_commanders_art_toolbox_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # A human-commander framing: combine all tools and adapt each turn.
+        assert "COMMANDER'S ART" in text
+        assert "air superiority" in text
+        assert "CAS/BAI" in text
+        assert "runways" in text
+        assert "adapt" in text
+
+    def test_other_stages_do_not_carry_commanders_art(self) -> None:
+        for stage in (CommanderStage.LOGISTICS, CommanderStage.AIR_TASKING):
+            assert "COMMANDER'S ART" not in stage_briefing_text(stage)
