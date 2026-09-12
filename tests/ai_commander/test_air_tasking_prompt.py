@@ -39,7 +39,7 @@ class TestAirTaskingBriefing:
         # Win the air before committing strikers, escort every striker.
         assert "sweep" in text
         assert "escort" in text
-        assert "only then commit strikers" in text
+        assert "win the air first" in text
         assert "air superiority" in text
 
     def test_mission_type_purposes_are_explained(self) -> None:
@@ -51,12 +51,27 @@ class TestAirTaskingBriefing:
 
     def test_front_line_air_support_doctrine_is_stated(self) -> None:
         text = self._text()
-        # CAP over the front, CAS/BAI for the ground battle, escort the strikers.
+        # CAS/BAI packaged against the front, escort the strikers; area CAP is
+        # planned automatically rather than attached to a target here.
         assert "FRONT-LINE AIR" in text
         assert "CAS" in text
         assert "BAI" in text
         assert "Escort" in text
-        assert "ground lost to enemy air" in text
+        assert "enemy_battle_positions" in text
+
+    def test_area_missions_must_not_be_package_flights(self) -> None:
+        text = self._text()
+        # Fighter sweep / BARCAP / TARCAP are area missions and must never be
+        # scheduled as a flight inside a target package -- the mistake that got
+        # three packages rejected on turn 17.
+        assert "AREA missions" in text
+        assert "Fighter sweep" in text
+        assert "BARCAP" in text
+        assert "TARCAP" in text
+        assert "packages[].flights" in text
+        # And the package-legal alternative for cutting enemy air is spelt out.
+        assert "OCA/Aircraft" in text
+        assert "OCA/Runway" in text
 
     def test_runway_strike_doctrine_is_stated(self) -> None:
         text = self._text()
