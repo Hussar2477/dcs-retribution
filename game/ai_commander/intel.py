@@ -23,6 +23,7 @@ for the audit log, and :meth:`RedCommanderBrief.render_compact` for the prompt.
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING
 
@@ -38,7 +39,8 @@ from game.ai_commander.enums import (
     StrengthBand,
     TargetSetCategory,
 )
-from game.ai_commander.debrief import DebriefSummary
+from game.ai_commander.debrief import DebriefSummary, ThreatCategory
+from game.ai_commander.naming import dedupe_type_names
 from game.ai_commander.serialization import jsonable, stable_hash
 
 if TYPE_CHECKING:
@@ -232,6 +234,143 @@ class ObservedEnemyForces:
         return jsonable(self)
 
 
+#: A recurring threat must have destroyed RED forces on at least this many of
+#: RED's own turns before it is worth flagging in the campaign memory. Measured
+#: in RED turns, never in enemy numbers.
+_MIN_RECURRENCE_TURNS = 2
+
+
+@dataclass(frozen=True)
+class CampaignMemory:
+    """Cumulative memory aggregated across every recorded turn of the campaign.
+
+    The observed-enemy-types and after-action sections describe only the most
+    recent mission; this remembers the whole campaign so the commander does not
+    forget what it has already faced. It is built solely from RED's own stored
+    briefs and after-action records -- the same information RED already had --
+    and so grants no new access to hidden BLUE state. Types only, de-duplicated;
+    never counts or measures of enemy strength. Recurrence is expressed in RED's
+    own turn count, not enemy numbers.
+    """
+
+    #: How many recorded turns this memory was aggregated from.
+    turns_recorded: int = 0
+    #: Union of every distinct enemy TYPE observed across the whole campaign.
+    observed: ObservedEnemyForces = field(default_factory=ObservedEnemyForces)
+    #: Recurring threat causes that keep destroying RED forces, each annotated
+    #: with how many of RED's own turns it recurred over. Causes only.
+    recurring_threats: tuple[str, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return self.turns_recorded == 0 or (
+            self.observed.is_empty and not self.recurring_threats
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return jsonable(self)
+
+
+def _threat_label(cause: str) -> str:
+    """Readable label for a stored threat-cause key."""
+
+    try:
+        return ThreatCategory(cause).label
+    except ValueError:
+        return str(cause).replace("_", " ").strip()
+
+
+def _str_values(raw: Any) -> Iterable[str]:
+    """Yield trimmed, non-empty strings from a stored list-like value."""
+
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _as_int(raw: Any) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_campaign_memory(records: Iterable[Any]) -> CampaignMemory:
+    """Aggregate RED's own decision-log records into a cumulative memory.
+
+    Reads only the stored ``intel_brief`` of each record -- the observed enemy
+    types and the after-action summary RED itself was already shown -- so no
+    hidden BLUE state is ever touched. Enemy types are unioned across all turns
+    and de-duplicated; recurring threat causes are counted by the number of RED
+    turns on which they destroyed RED forces (never by enemy numbers).
+    """
+
+    aircraft: set[str] = set()
+    air_defence: set[str] = set()
+    ground: set[str] = set()
+    naval: set[str] = set()
+    air_cause_turns: dict[str, set[int]] = defaultdict(set)
+    ground_cause_turns: dict[str, set[int]] = defaultdict(set)
+    turn_ids: set[int] = set()
+
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        brief = record.get("intel_brief")
+        if not isinstance(brief, Mapping):
+            continue
+        turn_id = _as_int(record.get("turn_id"))
+        turn_ids.add(turn_id)
+
+        observed = brief.get("observed_enemy_forces")
+        if isinstance(observed, Mapping):
+            aircraft.update(_str_values(observed.get("aircraft_types")))
+            air_defence.update(_str_values(observed.get("air_defence_types")))
+            ground.update(_str_values(observed.get("ground_types")))
+            naval.update(_str_values(observed.get("naval_types")))
+
+        after = brief.get("after_action")
+        if isinstance(after, Mapping):
+            aircraft.update(_str_values(after.get("enemy_aircraft_types_seen")))
+            air_by_cause = after.get("red_aircraft_lost_by_cause")
+            if isinstance(air_by_cause, Mapping):
+                for cause, count in air_by_cause.items():
+                    if _as_int(count) > 0:
+                        air_cause_turns[str(cause)].add(turn_id)
+            ground_by_cause = after.get("red_ground_units_lost_by_cause")
+            if isinstance(ground_by_cause, Mapping):
+                for cause, count in ground_by_cause.items():
+                    if _as_int(count) > 0:
+                        ground_cause_turns[str(cause)].add(turn_id)
+
+    recurring: list[tuple[int, str]] = []
+    for cause, turns in air_cause_turns.items():
+        count = len(turns)
+        if count >= _MIN_RECURRENCE_TURNS and cause != ThreatCategory.UNKNOWN.value:
+            recurring.append(
+                (count, f"aircraft losses to {_threat_label(cause)} ({count} turns)")
+            )
+    for cause, turns in ground_cause_turns.items():
+        count = len(turns)
+        if count >= _MIN_RECURRENCE_TURNS and cause != ThreatCategory.UNKNOWN.value:
+            recurring.append(
+                (count, f"ground losses to {_threat_label(cause)} ({count} turns)")
+            )
+    recurring.sort(key=lambda entry: (-entry[0], entry[1]))
+
+    observed_forces = ObservedEnemyForces(
+        aircraft_types=dedupe_type_names(aircraft),
+        air_defence_types=dedupe_type_names(air_defence),
+        ground_types=dedupe_type_names(ground),
+        naval_types=dedupe_type_names(naval),
+    )
+    return CampaignMemory(
+        turns_recorded=len(turn_ids),
+        observed=observed_forces,
+        recurring_threats=tuple(phrase for _, phrase in recurring),
+    )
+
+
 @dataclass(frozen=True)
 class RedCommanderBrief:
     """The complete, fair intelligence view handed to the model."""
@@ -265,6 +404,10 @@ class RedCommanderBrief:
     observed_enemy_forces: ObservedEnemyForces = field(
         default_factory=ObservedEnemyForces
     )
+    #: Cumulative, campaign-long memory aggregated from RED's own decision log:
+    #: the union of every enemy TYPE seen so far and the threat causes that keep
+    #: recurring. Types/causes only -- no counts of enemy strength.
+    campaign_memory: CampaignMemory = field(default_factory=CampaignMemory)
 
     # -- lookup helpers ---------------------------------------------------
 
@@ -467,6 +610,35 @@ class RedCommanderBrief:
                     f"fallback={entry.fallback_reason or 'none'}"
                 )
 
+        memory = self.campaign_memory
+        if not memory.is_empty:
+            lines += ["", "[CAMPAIGN MEMORY]"]
+            lines.append(
+                "A cumulative record built from your own past turns, so you do "
+                "not forget what this campaign has thrown at you. It lists the "
+                "distinct enemy TYPES seen across the whole campaign and the "
+                "threat causes that keep recurring. Types and causes only -- not "
+                "a count, roster or measure of enemy strength; the turn figures "
+                "are your own turns, not enemy numbers."
+            )
+            memory_observed = memory.observed
+            if memory_observed.aircraft_types:
+                lines.append(
+                    "aircraft seen: " + ", ".join(memory_observed.aircraft_types)
+                )
+            if memory_observed.air_defence_types:
+                lines.append(
+                    "air_defence seen: " + ", ".join(memory_observed.air_defence_types)
+                )
+            if memory_observed.ground_types:
+                lines.append("ground seen: " + ", ".join(memory_observed.ground_types))
+            if memory_observed.naval_types:
+                lines.append("naval seen: " + ", ".join(memory_observed.naval_types))
+            if memory.recurring_threats:
+                lines.append("recurring threats:")
+                for phrase in memory.recurring_threats:
+                    lines.append(f"- {phrase}")
+
         prior = self.prior_decision_summary
         if prior.turn is not None:
             lines += ["", "[LAST TURN]"]
@@ -584,6 +756,7 @@ class IntelProjector:
         prior_decision: Optional[PriorTurnSummary] = None,
         prior_outcome: Optional[PriorTurnSummary] = None,
         recent_decisions: tuple[PriorTurnSummary, ...] = (),
+        campaign_memory: Optional[CampaignMemory] = None,
     ) -> RedCommanderBrief:
         fronts = self._project_fronts()
         target_sets = self._project_target_sets(fronts)
@@ -607,6 +780,7 @@ class IntelProjector:
             prior_decision_summary=prior_decision or PriorTurnSummary(),
             prior_outcome_summary=prior_outcome or PriorTurnSummary(),
             recent_turn_summaries=recent_decisions,
+            campaign_memory=campaign_memory or CampaignMemory(),
             withheld_fields=(
                 REALISTIC_WITHHELD_FIELDS
                 if self.policy is IntelPolicy.REALISTIC
@@ -697,7 +871,7 @@ class IntelProjector:
                             names.add(cleaned)
             except (TypeError, AttributeError):
                 continue
-        return tuple(sorted(names))[:24]
+        return dedupe_type_names(names)
 
     def campaign_id_hash(self) -> str:
         """Stable identifier for this campaign, with no path or personal data."""

@@ -57,6 +57,7 @@ from game.ai_commander.directive import CommanderDirective
 from game.ai_commander.enums import CommanderMode, FallbackReason
 from game.ai_commander.execution import task_order_for
 from game.ai_commander.intel import (
+    CampaignMemory,
     IntelProjector,
     PriorTurnSummary,
     RedCommanderBrief,
@@ -835,6 +836,7 @@ class RedCommanderTurn:
         projector = IntelProjector(self.game, self.config.intel_policy)
         prior = None
         recent: tuple[PriorTurnSummary, ...] = ()
+        memory: Optional[CampaignMemory] = None
         if self.audit_log is not None:
             prior = self.audit_log.latest_summary(
                 projector.campaign_id_hash(), int(self.game.turn)
@@ -842,7 +844,14 @@ class RedCommanderTurn:
             recent = self.audit_log.recent_summaries(
                 projector.campaign_id_hash(), int(self.game.turn)
             )
-        return projector.project(prior_decision=prior, recent_decisions=recent)
+            memory = self.audit_log.campaign_memory(
+                projector.campaign_id_hash(), int(self.game.turn)
+            )
+        return projector.project(
+            prior_decision=prior,
+            recent_decisions=recent,
+            campaign_memory=memory,
+        )
 
     def _start_record(self, brief: RedCommanderBrief) -> None:
         record = self.record

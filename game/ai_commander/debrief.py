@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from enum import Enum, unique
 from typing import Any, ClassVar, Dict, Mapping, Optional, TYPE_CHECKING
 
+from game.ai_commander.naming import dedupe_type_names, dedupe_weapon_names
 from game.data.units import UnitClass
 
 if TYPE_CHECKING:
@@ -484,12 +485,6 @@ def _record_killer_types(
         weapons.add(weapon)
 
 
-def _capped_sorted(names: set[str], limit: int = 24) -> tuple[str, ...]:
-    """Deterministic, bounded tuple of distinct type names."""
-
-    return tuple(sorted(names))[:limit]
-
-
 def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
     """Distil a :class:`Debriefing` into a RED-perspective after-action summary.
 
@@ -589,9 +584,9 @@ def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
         blue_static_defenses_killed=blue_counts.ground_objects,
         blue_ships_killed=blue_counts.cargo_ships,
         blue_bases_captured=blue_counts.bases_lost,
-        killed_by_platform_types=_capped_sorted(killer_platforms),
-        killed_by_weapon_types=_capped_sorted(killer_weapons),
-        enemy_aircraft_types_seen=_capped_sorted(enemy_aircraft_types),
+        killed_by_platform_types=dedupe_type_names(killer_platforms),
+        killed_by_weapon_types=dedupe_weapon_names(killer_weapons),
+        enemy_aircraft_types_seen=dedupe_type_names(enemy_aircraft_types),
     )
 
 

@@ -73,20 +73,23 @@ def _tgo(*units: Any) -> Any:
 
 class TestDistinctUnitTypes:
     def test_dedupes_sorts_and_ignores_dead(self) -> None:
+        # Synthetic ids that do not resolve to a pydcs display name, so this test
+        # stays focused on de-duplication, sorting and dead-unit filtering rather
+        # than on the name normalisation exercised elsewhere.
         objects = [
-            _tgo(_unit("SA-11 Buk LN"), _unit("SA-11 Buk LN"), _unit("Dog Ear radar")),
+            _tgo(_unit("SA-11 Buk LN"), _unit("SA-11 Buk LN"), _unit("RADAR-X")),
             _tgo(_unit("SA-6 Kub LN"), _unit("SA-15 Tor", alive=False)),
         ]
         result = IntelProjector._distinct_unit_types(objects)
-        assert result == ("Dog Ear radar", "SA-11 Buk LN", "SA-6 Kub LN")
+        assert result == ("RADAR-X", "SA-11 Buk LN", "SA-6 Kub LN")
         # A type present only on a dead unit is not reported.
         assert "SA-15 Tor" not in result
 
     def test_returns_only_strings_never_counts(self) -> None:
-        objects = [_tgo(_unit("M-1 Abrams"), _unit("M-1 Abrams"))]
+        objects = [_tgo(_unit("GROUND-TANK-A"), _unit("GROUND-TANK-A"))]
         result = IntelProjector._distinct_unit_types(objects)
         # De-duplicated to a single type name, with no multiplicity recorded.
-        assert result == ("M-1 Abrams",)
+        assert result == ("GROUND-TANK-A",)
         assert all(isinstance(name, str) for name in result)
 
     def test_is_capped(self) -> None:

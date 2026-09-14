@@ -330,7 +330,7 @@ class TestBuildDebriefSummary:
             "F-15C",
             "F-16C",
             "M-1",
-            "USS_Arleigh",
+            "USS Arleigh",
         )
 
     def test_killed_by_weapon_types(self) -> None:
@@ -339,7 +339,7 @@ class TestBuildDebriefSummary:
         assert summary.killed_by_weapon_types == (
             "AIM-120C",
             "GBU-12",
-            "M256_APFSDS",
+            "M256 APFSDS",
             "SM-2",
         )
 

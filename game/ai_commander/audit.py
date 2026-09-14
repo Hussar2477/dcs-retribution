@@ -38,7 +38,12 @@ from typing import Any, Iterable, Iterator, Mapping, Optional
 
 from game.ai_commander.directive import CommanderDirective
 from game.ai_commander.enums import FallbackReason
-from game.ai_commander.intel import PriorTurnSummary, RedCommanderBrief
+from game.ai_commander.intel import (
+    CampaignMemory,
+    PriorTurnSummary,
+    RedCommanderBrief,
+    build_campaign_memory,
+)
 from game.ai_commander.serialization import canonical_json, jsonable, stable_hash
 
 #: Schema version of the record format itself, so a future reader can migrate.
@@ -55,6 +60,11 @@ LEGACY_RECORD_SCHEMA_VERSION = "red-commander-audit/1"
 
 #: Sub-directory of the save directory that holds the decision log.
 AUDIT_DIRECTORY_NAME = "AiDecisions"
+
+#: How many recent decided turns the brief shows RED so it can notice a losing
+#: approach it keeps repeating. Widened from 3 to give the commander a longer
+#: short-term window alongside the cumulative campaign memory.
+RECENT_TURNS_WINDOW = 6
 
 _FILENAME_RE = re.compile(r"^turn_(\d+)_(\d+)\.json$")
 
@@ -538,7 +548,10 @@ class AuditLog:
         return None
 
     def recent_summaries(
-        self, campaign_id_hash: str, before_turn: int, limit: int = 3
+        self,
+        campaign_id_hash: str,
+        before_turn: int,
+        limit: int = RECENT_TURNS_WINDOW,
     ) -> tuple[PriorTurnSummary, ...]:
         """Summaries of the last ``limit`` decided turns, most recent first.
 
@@ -565,6 +578,23 @@ class AuditLog:
         for turn_id in self.turns(campaign_id_hash):
             records.extend(self.records_for_turn(campaign_id_hash, turn_id))
         return records
+
+    def campaign_memory(
+        self, campaign_id_hash: str, before_turn: Optional[int] = None
+    ) -> CampaignMemory:
+        """Cumulative memory aggregated from every recorded turn so far.
+
+        Reads only RED's own stored briefs, so it grants no new access to hidden
+        BLUE state. ``before_turn`` excludes the turn currently being decided so
+        the memory reflects only what RED has already seen resolve.
+        """
+
+        records: list[dict[str, Any]] = []
+        for turn_id in self.turns(campaign_id_hash):
+            if before_turn is not None and turn_id >= before_turn:
+                continue
+            records.extend(self.records_for_turn(campaign_id_hash, turn_id))
+        return build_campaign_memory(records)
 
 
 def summary_from_payload(payload: Mapping[str, Any]) -> PriorTurnSummary:
