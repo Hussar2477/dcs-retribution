@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QLabel,
+    QLineEdit,
     QListView,
     QPushButton,
     QScrollArea,
@@ -37,13 +38,16 @@ from game.settings import (
     MinutesOption,
     OptionDescription,
     Settings,
+    TextOption,
 )
+from game.settings.settings import AI_OPPONENT_PAGE
 from game.settings.ISettingsContainer import SettingsContainer
 from game.sim import GameUpdateEvents
 from pydcs_extensions import BanditClouds
 from qt_ui.widgets.QLabeledWidget import QLabeledWidget
 from qt_ui.widgets.spinsliders import FloatSpinSlider, TimeInputs
 from qt_ui.windows.GameUpdateSignal import GameUpdateSignal
+from qt_ui.windows.settings.aicommanderkey import AiCommanderKeyBox
 from qt_ui.windows.settings.plugins import PluginOptionsPage, PluginsPage
 
 
@@ -173,6 +177,8 @@ class AutoSettingsLayout(QGridLayout):
                 self.add_spinner_for(row, name, description)
             elif isinstance(description, MinutesOption):
                 self.add_duration_controls_for(row, name, description)
+            elif isinstance(description, TextOption):
+                self.add_text_field_for(row, name, description)
             else:
                 raise TypeError(f"Unhandled option type: {description}")
 
@@ -268,6 +274,22 @@ class AutoSettingsLayout(QGridLayout):
         self.addLayout(inputs, row, 1, Qt.AlignmentFlag.AlignRight)
         self.settings_map[name] = inputs
 
+    def add_text_field_for(self, row: int, name: str, description: TextOption) -> None:
+        def on_changed(value: str) -> None:
+            self.sc.settings.__dict__[name] = value.strip()
+            if description.causes_expensive_game_update:
+                self.write_full_settings()
+
+        field = QLineEdit()
+        field.setMaxLength(description.max_length)
+        if description.placeholder is not None:
+            field.setPlaceholderText(description.placeholder)
+        field.setMinimumWidth(280)
+        field.setText(str(self.sc.settings.__dict__[name]))
+        field.textChanged.connect(on_changed)
+        self.addWidget(field, row, 1, Qt.AlignmentFlag.AlignRight)
+        self.settings_map[name] = field
+
     def update_from_settings(self) -> None:
         for name, description in Settings.fields(self.page, self.section):
             widget = self.settings_map[name]
@@ -287,6 +309,9 @@ class AutoSettingsLayout(QGridLayout):
                 widget.spinner.setValue(int(value * widget.spinner.divisor))
             elif isinstance(widget, QSpinBox):
                 widget.setValue(value)
+            elif isinstance(widget, QLineEdit):
+                if widget.text() != value:
+                    widget.setText(str(value))
             elif isinstance(widget, TimeInputs):
                 widget.spinner.setValue(value.seconds // 60)
 
@@ -323,6 +348,11 @@ class AutoSettingsPageLayout(QVBoxLayout):
                 AutoSettingsGroup(page, section, sc, write_full_settings)
             )
             self.addWidget(self.widgets[-1])
+
+        if page == AI_OPPONENT_PAGE:
+            # The API key is not a setting, so it cannot be generated from the
+            # settings metadata like everything else on this page.
+            self.addWidget(AiCommanderKeyBox())
 
     def update_from_settings(self) -> None:
         for w in self.widgets:

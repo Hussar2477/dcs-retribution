@@ -36,6 +36,7 @@ COMMIT_STEPS = [
     "commit_captures",
     "commit_front_line_battle_impact",
     "record_carcasses",
+    "record_red_after_action",
 ]
 
 
