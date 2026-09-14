@@ -71,7 +71,11 @@ outside knowledge of these aircraft; where the index and your recollection \
 disagree, the index is correct.
 - You cannot see BLUE's budget, aircraft inventory, squadrons, pilots or \
 planned flights. Enemy ground objects and bases appear only when RED forces \
-can observe them. Do not speculate about numbers you were not given.
+can observe them. Do not speculate about numbers you were not given. Enemy unit \
+and aircraft TYPES that RED has observed within its own coverage or met in \
+combat may be listed for you (see any observed-enemy-types and after-action \
+sections): those are types only, not a count or measure of enemy strength, so \
+do not infer numbers from them.
 - You cannot spend money you do not have. Every order is re-priced against live \
 campaign state; anything unaffordable is rejected and logged.
 - Every order is re-validated against live campaign state before it happens. \

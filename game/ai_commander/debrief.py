@@ -202,6 +202,20 @@ class DebriefSummary:
     blue_ships_killed: int = 0
     blue_bases_captured: int = 0
 
+    # -- Killer / weapon intel for RED's own losses (types only) ----------
+    #: Distinct enemy platform TYPES that destroyed RED units this turn (DCS
+    #: type names taken from the kill initiator). Types only -- no counts and no
+    #: roster; this is not a measure of enemy strength.
+    killed_by_platform_types: tuple[str, ...] = ()
+    #: Distinct weapon TYPES DCS reported used against RED units this turn.
+    #: Types only.
+    killed_by_weapon_types: tuple[str, ...] = ()
+    #: Distinct BLUE aircraft TYPES RED engaged or downed this turn (kill
+    #: initiators classed as aircraft, plus confirmed BLUE air losses). Feeds
+    #: the observed-enemy-types intel; types only, never counts. Not rendered in
+    #: the after-action block itself.
+    enemy_aircraft_types_seen: tuple[str, ...] = ()
+
     @property
     def is_empty(self) -> bool:
         """True when nothing worth reporting happened this turn."""
@@ -241,6 +255,9 @@ class DebriefSummary:
             "blue_static_defenses_killed": self.blue_static_defenses_killed,
             "blue_ships_killed": self.blue_ships_killed,
             "blue_bases_captured": self.blue_bases_captured,
+            "killed_by_platform_types": list(self.killed_by_platform_types),
+            "killed_by_weapon_types": list(self.killed_by_weapon_types),
+            "enemy_aircraft_types_seen": list(self.enemy_aircraft_types_seen),
         }
 
     @classmethod
@@ -262,6 +279,20 @@ class DebriefSummary:
                         continue
             return result
 
+        def as_str_tuple(key: str) -> tuple[str, ...]:
+            raw = data.get(key, ()) or ()
+            if isinstance(raw, (str, bytes)):
+                return ()
+            result: list[str] = []
+            try:
+                for item in raw:
+                    text = str(item).strip()
+                    if text:
+                        result.append(text)
+            except TypeError:
+                return ()
+            return tuple(result)
+
         return cls(
             turn=as_int("turn"),
             red_aircraft_lost=as_int("red_aircraft_lost"),
@@ -278,6 +309,9 @@ class DebriefSummary:
             blue_static_defenses_killed=as_int("blue_static_defenses_killed"),
             blue_ships_killed=as_int("blue_ships_killed"),
             blue_bases_captured=as_int("blue_bases_captured"),
+            killed_by_platform_types=as_str_tuple("killed_by_platform_types"),
+            killed_by_weapon_types=as_str_tuple("killed_by_weapon_types"),
+            enemy_aircraft_types_seen=as_str_tuple("enemy_aircraft_types_seen"),
         )
 
     # -- rendering --------------------------------------------------------
@@ -390,6 +424,19 @@ class DebriefSummary:
         if other_red:
             lines.append("red_other_losses: " + ", ".join(other_red))
 
+        losses_intel = []
+        if self.killed_by_platform_types:
+            losses_intel.append(
+                "platforms: " + ", ".join(self.killed_by_platform_types)
+            )
+        if self.killed_by_weapon_types:
+            losses_intel.append("weapons: " + ", ".join(self.killed_by_weapon_types))
+        if losses_intel:
+            lines.append(
+                "our_losses_killed_by (types only, not enemy strength) -- "
+                + "; ".join(losses_intel)
+            )
+
         kills = []
         if self.blue_aircraft_killed:
             kills.append(f"aircraft={self.blue_aircraft_killed}")
@@ -409,6 +456,38 @@ class DebriefSummary:
             lines.append(guidance)
 
         return "\n".join(lines)
+
+
+def _record_killer_types(
+    cause: Mapping[str, str],
+    unit_map: UnitMap,
+    platforms: set[str],
+    weapons: set[str],
+    enemy_aircraft: set[str],
+) -> None:
+    """Record the enemy platform and weapon TYPES from one RED-loss kill record.
+
+    ``by_type`` is the DCS type name of the unit that scored the kill and
+    ``weapon`` the DCS weapon type name; both are recorded as types only -- never
+    counts. When the killer is an aircraft its type is also noted as an engaged
+    enemy aircraft type. Best-effort: absent fields are simply skipped.
+    """
+
+    platform = (cause.get("by_type") or "").strip()
+    if platform:
+        platforms.add(platform)
+        killer_class = _killer_unit_class(cause.get("by"), unit_map)
+        if killer_class in (UnitClass.PLANE, UnitClass.HELICOPTER):
+            enemy_aircraft.add(platform)
+    weapon = (cause.get("weapon") or "").strip()
+    if weapon:
+        weapons.add(weapon)
+
+
+def _capped_sorted(names: set[str], limit: int = 24) -> tuple[str, ...]:
+    """Deterministic, bounded tuple of distinct type names."""
+
+    return tuple(sorted(names))[:limit]
 
 
 def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
@@ -431,6 +510,11 @@ def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
     attributed_ground = 0
     seen_targets: set[str] = set()
 
+    # Killer / weapon intel for RED's own losses (types only, no counts).
+    killer_platforms: set[str] = set()
+    killer_weapons: set[str] = set()
+    enemy_aircraft_types: set[str] = set()
+
     for cause in debriefing.state_data.kill_causes:
         target = cause.get("target")
         if not target or target in seen_targets:
@@ -442,11 +526,25 @@ def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
             if not flying.flight.departure.captured.is_blue:  # RED aircraft
                 air_by_cause[_resolve_cause(cause, unit_map)] += 1
                 attributed_air += 1
+                _record_killer_types(
+                    cause,
+                    unit_map,
+                    killer_platforms,
+                    killer_weapons,
+                    enemy_aircraft_types,
+                )
             continue
 
         if _ground_victim_is_red(target, unit_map):
             ground_by_cause[_resolve_cause(cause, unit_map)] += 1
             attributed_ground += 1
+            _record_killer_types(
+                cause,
+                unit_map,
+                killer_platforms,
+                killer_weapons,
+                enemy_aircraft_types,
+            )
 
     red_air_total = red_counts.aircraft
     if red_air_total > attributed_air:
@@ -466,6 +564,13 @@ def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
         for aircraft_type, count in debriefing.air_losses.by_type(Player.RED).items()
     }
 
+    # BLUE aircraft RED downed this turn become observable once destroyed, so
+    # their types are fair to record alongside the killer aircraft types above.
+    for aircraft_type in debriefing.air_losses.by_type(Player.BLUE):
+        name = str(aircraft_type).strip()
+        if name:
+            enemy_aircraft_types.add(name)
+
     return DebriefSummary(
         turn=int(game.turn),
         red_aircraft_lost=red_air_total,
@@ -484,6 +589,9 @@ def build_debrief_summary(debriefing: Debriefing, game: Game) -> DebriefSummary:
         blue_static_defenses_killed=blue_counts.ground_objects,
         blue_ships_killed=blue_counts.cargo_ships,
         blue_bases_captured=blue_counts.bases_lost,
+        killed_by_platform_types=_capped_sorted(killer_platforms),
+        killed_by_weapon_types=_capped_sorted(killer_weapons),
+        enemy_aircraft_types_seen=_capped_sorted(enemy_aircraft_types),
     )
 
 

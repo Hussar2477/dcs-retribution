@@ -40,7 +40,9 @@ Rules you cannot break:
 identifiers are discarded.
 - You may only use the enumerated values listed in the briefing.
 - You cannot see BLUE's budget, aircraft inventory, squadrons or planned \
-flights, and you must not speculate about exact numbers you were not given.
+flights, and you must not speculate about exact numbers you were not given. \
+Enemy unit and aircraft TYPES that RED has observed or met in combat may be \
+listed for you: those are types only, not a count or measure of enemy strength.
 - Your directive is re-validated against live campaign state. Anything illegal \
 or unaffordable is rejected and logged; it does not happen.
 - Ranks start at 1, where 1 is the highest priority, and must be unique within \

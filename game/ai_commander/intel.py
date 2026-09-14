@@ -198,6 +198,41 @@ class PriorTurnSummary:
 
 
 @dataclass(frozen=True)
+class ObservedEnemyForces:
+    """Distinct enemy unit and aircraft TYPES RED has observed or met in combat.
+
+    Types only -- never counts, strengths, rosters or order of battle. Sourced
+    solely from fog-of-war observation (enemy objectives falling within RED's own
+    sensor and threat coverage) and from the after-action debrief (types seen in
+    engagements). This is emphatically not a measure of enemy strength and no
+    numbers can be inferred from it.
+    """
+
+    #: BLUE aircraft types RED engaged or downed (from the after-action debrief).
+    aircraft_types: tuple[str, ...] = ()
+    #: BLUE air-defence unit types observed within RED's coverage.
+    air_defence_types: tuple[str, ...] = ()
+    #: BLUE ground (motorpool) unit types observed within RED's coverage.
+    ground_types: tuple[str, ...] = ()
+    #: BLUE naval unit types observed within RED's coverage.
+    naval_types: tuple[str, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.aircraft_types,
+                self.air_defence_types,
+                self.ground_types,
+                self.naval_types,
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return jsonable(self)
+
+
+@dataclass(frozen=True)
 class RedCommanderBrief:
     """The complete, fair intelligence view handed to the model."""
 
@@ -225,6 +260,11 @@ class RedCommanderBrief:
     #: attributed to their causes, plus confirmed BLUE losses). None on the very
     #: first turn or when nothing has been flown yet.
     after_action: Optional[DebriefSummary] = None
+    #: Distinct enemy unit/aircraft TYPES RED has observed within its own sensor
+    #: coverage or met in combat. Types only -- no counts, no order of battle.
+    observed_enemy_forces: ObservedEnemyForces = field(
+        default_factory=ObservedEnemyForces
+    )
 
     # -- lookup helpers ---------------------------------------------------
 
@@ -345,6 +385,26 @@ class RedCommanderBrief:
                 f"threatens_us={'yes' if target.threatens_own_forces else 'no'}"
                 + (f" | {target.notes}" if target.notes else "")
             )
+
+        observed_forces = self.observed_enemy_forces
+        if not observed_forces.is_empty:
+            lines += ["", "[OBSERVED ENEMY TYPES]"]
+            lines.append(
+                "Distinct enemy unit and aircraft TYPES you have observed within "
+                "your sensor and threat coverage, or met in combat last mission. "
+                "This is a list of types only -- not a count, roster or measure "
+                "of enemy strength; do not infer numbers from it."
+            )
+            if observed_forces.aircraft_types:
+                lines.append("aircraft: " + ", ".join(observed_forces.aircraft_types))
+            if observed_forces.air_defence_types:
+                lines.append(
+                    "air_defence: " + ", ".join(observed_forces.air_defence_types)
+                )
+            if observed_forces.ground_types:
+                lines.append("ground: " + ", ".join(observed_forces.ground_types))
+            if observed_forces.naval_types:
+                lines.append("naval: " + ", ".join(observed_forces.naval_types))
 
         lines += ["", "[SPENDING CATEGORIES]"]
         for category in self.procurement_categories:
@@ -527,8 +587,10 @@ class IntelProjector:
     ) -> RedCommanderBrief:
         fronts = self._project_fronts()
         target_sets = self._project_target_sets(fronts)
+        after_action = self._project_after_action()
         return RedCommanderBrief(
-            after_action=self._project_after_action(),
+            after_action=after_action,
+            observed_enemy_forces=self._project_observed_enemy_forces(after_action),
             schema_version=SCHEMA_VERSION,
             campaign_id_hash=self.campaign_id_hash(),
             campaign_revision=self.campaign_revision(),
@@ -568,6 +630,74 @@ class IntelProjector:
         except Exception:  # noqa: BLE001 - a malformed summary is simply omitted
             logging.warning("Ignoring malformed stored after-action summary")
             return None
+
+    def _project_observed_enemy_forces(
+        self, after_action: Optional[DebriefSummary]
+    ) -> ObservedEnemyForces:
+        """Distinct enemy unit/aircraft TYPES RED has observed or met, types only.
+
+        Air-defence, ground and naval types come from fog-of-war observation of
+        enemy objectives that fall within RED's own sensor and threat coverage
+        (the same ``_observable`` filter used for target sets). Aircraft types
+        come only from the after-action debrief -- what RED actually engaged --
+        because parked enemy aircraft inventory is withheld intelligence. This is
+        a de-duplicated list of types: no counts, no order of battle, no measure
+        of enemy strength.
+        """
+
+        from game.commander.objectivefinder import ObjectiveFinder
+
+        finder = ObjectiveFinder(self.game, self.player)
+
+        def safe(call: Any) -> list[Any]:
+            try:
+                return list(call())
+            except Exception:  # pragma: no cover - defensive
+                logging.debug("Objective enumeration failed", exc_info=True)
+                return []
+
+        air_defences = self._observable(safe(finder.enemy_air_defenses))
+        motorpools = self._observable(safe(finder.motorpool_targets))
+        ships = self._observable(safe(finder.enemy_ships))
+
+        aircraft_types = (
+            tuple(after_action.enemy_aircraft_types_seen)
+            if after_action is not None
+            else ()
+        )
+
+        return ObservedEnemyForces(
+            aircraft_types=aircraft_types,
+            air_defence_types=self._distinct_unit_types(air_defences),
+            ground_types=self._distinct_unit_types(motorpools),
+            naval_types=self._distinct_unit_types(ships),
+        )
+
+    @staticmethod
+    def _distinct_unit_types(objects: Iterable[Any]) -> tuple[str, ...]:
+        """Distinct DCS unit-type names of the live units in observed objects.
+
+        Types only -- never counts. Each object is read defensively: anything
+        that does not expose iterable units (including a test double) simply
+        contributes nothing rather than raising, so observation can never leak or
+        crash.
+        """
+
+        names: set[str] = set()
+        for obj in objects:
+            try:
+                for unit in getattr(obj, "units", ()):
+                    if not getattr(unit, "alive", False):
+                        continue
+                    unit_type = getattr(unit, "type", None)
+                    type_id = getattr(unit_type, "id", None)
+                    if type_id:
+                        cleaned = str(type_id).strip()
+                        if cleaned:
+                            names.add(cleaned)
+            except (TypeError, AttributeError):
+                continue
+        return tuple(sorted(names))[:24]
 
     def campaign_id_hash(self) -> str:
         """Stable identifier for this campaign, with no path or personal data."""

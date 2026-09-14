@@ -144,11 +144,16 @@ class FakeUnitMap:
 
 
 class FakeAirLosses:
-    def __init__(self, red_by_type: dict[str, int]) -> None:
+    def __init__(
+        self,
+        red_by_type: dict[str, int],
+        blue_by_type: Optional[dict[str, int]] = None,
+    ) -> None:
         self._red_by_type = red_by_type
+        self._blue_by_type = blue_by_type or {}
 
     def by_type(self, player: Player) -> dict[str, int]:
-        return self._red_by_type if player.is_red else {}
+        return self._red_by_type if player.is_red else self._blue_by_type
 
 
 class FakeDebriefing:
@@ -159,12 +164,13 @@ class FakeDebriefing:
         red_counts: SideLossCounts,
         blue_counts: SideLossCounts,
         red_air_by_type: dict[str, int],
+        blue_air_by_type: Optional[dict[str, int]] = None,
     ) -> None:
         self.unit_map = unit_map
         self.state_data = SimpleNamespace(kill_causes=kill_causes)
         self._red = red_counts
         self._blue = blue_counts
-        self.air_losses = FakeAirLosses(red_air_by_type)
+        self.air_losses = FakeAirLosses(red_air_by_type, blue_air_by_type)
 
     def loss_counts(self, player: Player) -> SideLossCounts:
         return self._red if player.is_red else self._blue
@@ -213,15 +219,41 @@ class TestBuildDebriefSummary:
         }
         kill_causes = [
             # RED CAS downed by a BLUE fighter -> enemy aircraft
-            {"target": "red-cas-1", "by": "blue-f15-1", "by_type": "F-15C"},
+            {
+                "target": "red-cas-1",
+                "by": "blue-f15-1",
+                "by_type": "F-15C",
+                "weapon": "AIM-120C",
+            },
             # RED CAS downed by a BLUE warship -> naval / ship-launched SAM
-            {"target": "red-cas-2", "by": "blue-ship-1", "by_type": "USS_Arleigh"},
+            {
+                "target": "red-cas-2",
+                "by": "blue-ship-1",
+                "by_type": "USS_Arleigh",
+                "weapon": "SM-2",
+            },
             # RED tank destroyed by a BLUE tank -> ground fire
-            {"target": "red-tank-1", "by": "blue-tank-1", "by_type": "M-1"},
+            {
+                "target": "red-tank-1",
+                "by": "blue-tank-1",
+                "by_type": "M-1",
+                "weapon": "M256_APFSDS",
+            },
             # RED SAM site destroyed by a BLUE jet -> enemy aircraft (ground victim)
-            {"target": "red-sam-site-1", "by": "blue-f16-1", "by_type": "F-16C"},
-            # A BLUE victim RED killed; must not be attributed to RED's losses.
-            {"target": "blue-jet-1", "by": "red-mig-1", "by_type": "MiG-29"},
+            {
+                "target": "red-sam-site-1",
+                "by": "blue-f16-1",
+                "by_type": "F-16C",
+                "weapon": "GBU-12",
+            },
+            # A BLUE victim RED killed; its killer/weapon must not be attributed
+            # to RED's losses.
+            {
+                "target": "blue-jet-1",
+                "by": "red-mig-1",
+                "by_type": "MiG-29",
+                "weapon": "R-27",
+            },
         ]
         red_counts = _counts(
             aircraft=3,  # 2 attributed above + 1 auto-resolved (UNKNOWN)
@@ -242,6 +274,8 @@ class TestBuildDebriefSummary:
             red_counts,
             blue_counts,
             red_air_by_type={"Su-25": 2, "MiG-29": 1},
+            # BLUE aircraft RED downed this turn become observable once dead.
+            blue_air_by_type={"FA-18C": 2},
         )
 
     def _summary(self) -> DebriefSummary:
@@ -288,6 +322,47 @@ class TestBuildDebriefSummary:
         assert summary.blue_static_defenses_killed == 2
         assert summary.blue_ships_killed == 1
         assert summary.blue_bases_captured == 1
+
+    def test_killed_by_platform_types(self) -> None:
+        # Distinct enemy platform TYPES that destroyed RED units, sorted, deduped.
+        summary = self._summary()
+        assert summary.killed_by_platform_types == (
+            "F-15C",
+            "F-16C",
+            "M-1",
+            "USS_Arleigh",
+        )
+
+    def test_killed_by_weapon_types(self) -> None:
+        # Distinct weapon TYPES used against RED units, sorted, deduped.
+        summary = self._summary()
+        assert summary.killed_by_weapon_types == (
+            "AIM-120C",
+            "GBU-12",
+            "M256_APFSDS",
+            "SM-2",
+        )
+
+    def test_enemy_aircraft_types_seen(self) -> None:
+        # Killer types classed as aircraft (F-15C, F-16C) plus confirmed BLUE
+        # air losses (FA-18C). Ship/tank killers are not aircraft.
+        summary = self._summary()
+        assert summary.enemy_aircraft_types_seen == ("F-15C", "F-16C", "FA-18C")
+
+    def test_blue_victim_killer_not_counted_as_red_loss_intel(self) -> None:
+        # RED shot down blue-jet-1 with a MiG-29/R-27; those are RED's own
+        # platform and weapon and must not surface as things that killed RED.
+        summary = self._summary()
+        assert "MiG-29" not in summary.killed_by_platform_types
+        assert "MiG-29" not in summary.enemy_aircraft_types_seen
+        assert "R-27" not in summary.killed_by_weapon_types
+
+    def test_type_intel_carries_no_counts(self) -> None:
+        # The intel is types only: plain tuples of strings, never counts.
+        summary = self._summary()
+        assert all(isinstance(name, str) for name in summary.killed_by_platform_types)
+        assert all(isinstance(name, str) for name in summary.killed_by_weapon_types)
+        assert all(isinstance(name, str) for name in summary.enemy_aircraft_types_seen)
 
     def test_red_incidental_losses(self) -> None:
         summary = self._summary()
@@ -433,6 +508,58 @@ class TestRenderingAndSerialisation:
     def test_round_trips_through_dict(self) -> None:
         summary = self._summary()
         assert DebriefSummary.from_dict(summary.to_dict()) == summary
+
+    def test_render_shows_killer_and_weapon_types(self) -> None:
+        summary = DebriefSummary(
+            turn=7,
+            red_aircraft_lost=1,
+            red_aircraft_lost_by_cause={"enemy_aircraft": 1},
+            killed_by_platform_types=("F-15C", "SA-11"),
+            killed_by_weapon_types=("AIM-120C", "9M38"),
+        )
+        rendered = summary.render_compact()
+        assert "our_losses_killed_by" in rendered
+        assert "platforms: F-15C, SA-11" in rendered
+        assert "weapons: AIM-120C, 9M38" in rendered
+        # The line is explicit that it is types only, not enemy strength.
+        assert "types only, not enemy strength" in rendered
+
+    def test_enemy_aircraft_types_seen_not_rendered(self) -> None:
+        # This field feeds the observed-enemy-types intel channel, not the
+        # after-action block, so it must not appear in the after-action render.
+        summary = DebriefSummary(
+            turn=7,
+            red_aircraft_lost=1,
+            red_aircraft_lost_by_cause={"enemy_aircraft": 1},
+            enemy_aircraft_types_seen=("F-15C", "F-16C"),
+        )
+        rendered = summary.render_compact()
+        assert "F-15C" not in rendered
+        assert "F-16C" not in rendered
+
+    def test_round_trips_with_type_intel(self) -> None:
+        summary = DebriefSummary(
+            turn=7,
+            red_aircraft_lost=1,
+            killed_by_platform_types=("F-15C", "SA-11"),
+            killed_by_weapon_types=("AIM-120C",),
+            enemy_aircraft_types_seen=("F-15C", "F-16C"),
+        )
+        assert DebriefSummary.from_dict(summary.to_dict()) == summary
+
+    def test_from_dict_coerces_type_intel_to_string_tuples(self) -> None:
+        summary = DebriefSummary.from_dict(
+            {
+                "turn": 2,
+                "killed_by_platform_types": ["F-15C", "", "  SA-11  ", 42],
+                "killed_by_weapon_types": "not-a-list",
+                "enemy_aircraft_types_seen": None,
+            }
+        )
+        # Empties dropped, values stripped, non-list weapon field ignored.
+        assert summary.killed_by_platform_types == ("F-15C", "SA-11", "42")
+        assert summary.killed_by_weapon_types == ()
+        assert summary.enemy_aircraft_types_seen == ()
 
     def test_from_dict_tolerates_garbage(self) -> None:
         summary = DebriefSummary.from_dict(
