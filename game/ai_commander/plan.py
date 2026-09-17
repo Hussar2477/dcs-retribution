@@ -58,6 +58,59 @@ MAX_INTENT_CHARACTERS = 400
 
 _MISSION_BY_VALUE: dict[str, FlightType] = {t.value: t for t in PLANNABLE_MISSION_TYPES}
 
+#: Area missions patrol a slice of sky and are never flown against a specific
+#: target, so they can never lead or even join a target package. They are dropped
+#: from packages rather than auto-repaired into strikers.
+_AREA_MISSION_TYPES: frozenset[FlightType] = frozenset(
+    {FlightType.BARCAP, FlightType.TARCAP, FlightType.SWEEP}
+)
+
+#: Preference order used when auto-repairing a striker flight whose mission_type
+#: is illegal for its target: the first of these that appears in the target's
+#: legal missions is chosen as the package's leading strike mission. It runs from
+#: the most target-specific strike (Strike, Anti-ship, OCA) through the ground
+#: attack and SEAD/DEAD families, so a repaired flight is always given the most
+#: appropriate legal mission for the objective it was pointed at.
+_STRIKER_PREFERENCE: tuple[FlightType, ...] = (
+    FlightType.STRIKE,
+    FlightType.ANTISHIP,
+    FlightType.OCA_AIRCRAFT,
+    FlightType.OCA_RUNWAY,
+    FlightType.DEAD,
+    FlightType.SEAD,
+    FlightType.SEAD_SWEEP,
+    FlightType.CAS,
+    FlightType.BAI,
+    FlightType.ARMED_RECON,
+    FlightType.AIR_ASSAULT,
+)
+
+
+def _primary_striker_mission(legal_missions: Sequence[str]) -> Optional[FlightType]:
+    """The mission a repaired striker flight should carry for this target.
+
+    Picks the most appropriate legal striking mission: the first entry of
+    :data:`_STRIKER_PREFERENCE` present in ``legal_missions``, falling back to
+    the first legal mission that is neither an escort nor an area mission (for a
+    target category whose striker is not in the preference table). Returns
+    ``None`` only when the target offers no striking mission at all, in which
+    case no package can legitimately be built against it.
+    """
+
+    legal = set(legal_missions)
+    for mission in _STRIKER_PREFERENCE:
+        if mission.value in legal:
+            return mission
+    for value in legal_missions:
+        candidate = _MISSION_BY_VALUE.get(value)
+        if (
+            candidate is not None
+            and candidate not in ESCORT_MISSION_TYPES
+            and candidate not in _AREA_MISSION_TYPES
+        ):
+            return candidate
+    return None
+
 
 @unique
 class CommanderStage(Enum):
@@ -1030,15 +1083,32 @@ def validate_air_tasking_plan(
         )
         if not flights:
             continue
-        if flights[0].mission_type in ESCORT_MISSION_TYPES:
+        # Auto-repair the flight order: a package must be led by a striker, with
+        # escorts riding as supporting flights. Rather than reject a package
+        # whose escort was listed first (a mistake the model makes repeatedly),
+        # promote the first striker to the lead. If the package holds no striker
+        # at all -- only escorts -- there is nothing to lead it, so it is
+        # genuinely rejected: we cannot invent a strike flight.
+        lead = next(
+            (
+                position
+                for position, flight in enumerate(flights)
+                if flight.mission_type not in ESCORT_MISSION_TYPES
+            ),
+            None,
+        )
+        if lead is None:
             rejections.append(
                 Rejection(
-                    element=f"{element}.flights[0].mission_type",
-                    reason="an escort cannot be the primary flight of a package",
-                    value=flights[0].mission_type.value,
+                    element=f"{element}.flights",
+                    reason="a package needs a strike or attack flight to lead it; "
+                    "only escorts were provided",
+                    value=[flight.mission_type.value for flight in flights],
                 )
             )
             continue
+        if lead != 0:
+            flights.insert(0, flights.pop(lead))
 
         priority = entry.get("priority")
         if not isinstance(priority, int) or isinstance(priority, bool) or priority < 1:
@@ -1096,6 +1166,7 @@ def _validate_flights(
         raw_flights = raw_flights[:MAX_FLIGHTS_PER_PACKAGE]
 
     allowed = set(legal_missions) | {t.value for t in ESCORT_MISSION_TYPES}
+    primary_striker = _primary_striker_mission(legal_missions)
     flights: list[ProposedFlightOrder] = []
     for position, raw in enumerate(raw_flights):
         flight_element = f"{element}.flights[{position}]"
@@ -1122,15 +1193,26 @@ def _validate_flights(
             )
             continue
         if mission.value not in allowed:
-            rejections.append(
-                Rejection(
-                    element=f"{flight_element}.mission_type",
-                    reason="this mission type cannot be flown against this objective; "
-                    f"legal values were {','.join(sorted(allowed))}",
-                    value=mission.value,
+            # Auto-repair an illegal mission_type instead of rejecting it. A
+            # striker flight pointed at the wrong mission for its target (for
+            # example OCA/Runway or SEAD against an oil-infrastructure target
+            # whose only legal strike is Strike) is silently remapped to the
+            # target's primary legal striking mission, so a correctly-intended,
+            # escorted package is kept rather than thrown away. Two cases are NOT
+            # repaired and are still dropped: an area mission (Fighter sweep,
+            # BARCAP, TARCAP) can never be a package flight at all, and if the
+            # target offers no striking mission there is nothing to remap to.
+            if mission in _AREA_MISSION_TYPES or primary_striker is None:
+                rejections.append(
+                    Rejection(
+                        element=f"{flight_element}.mission_type",
+                        reason="this mission type cannot be flown against this "
+                        f"objective; legal values were {','.join(sorted(allowed))}",
+                        value=mission.value,
+                    )
                 )
-            )
-            continue
+                continue
+            mission = primary_striker
         count = _quantity(
             f"{flight_element}.aircraft_count",
             raw.get("aircraft_count"),

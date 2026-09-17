@@ -152,6 +152,12 @@ class TestLogisticsBriefing:
         assert "surplus" in text
         assert "underspending" in text
 
+    def test_buy_in_blocks_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Size each buy to the surplus; buy in blocks, not two or three at a time.
+        assert "BLOCKS" in text
+        assert "dozens" in text
+
     def test_front_line_air_defence_doctrine_is_stated(self) -> None:
         text = self._text()
         # Buy AAA and transfer owned SAM/SHORAD/MANPADS forward to the front.
@@ -200,6 +206,14 @@ class TestCommandBriefing:
         assert "PRODUCTION" in text
         assert "recruit_ground=yes" in text
         assert "factory" in text
+
+    def test_press_the_advantage_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # With a force advantage on a capturable front, press rather than hold;
+        # rebuilding air defence and pressing are not mutually exclusive.
+        assert "PRESS THE ADVANTAGE" in text
+        assert "capturable" in text
+        assert "mutually exclusive" in text
 
     def test_commanders_art_toolbox_doctrine_is_stated(self) -> None:
         text = self._text()

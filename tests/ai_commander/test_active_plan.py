@@ -261,8 +261,16 @@ class TestAirTaskingCheatAttempts:
         assert plan is not None
         assert not plan.packages
 
-    def test_an_illegal_mission_for_the_objective_is_rejected(self) -> None:
-        """TGT-1 is an air-defence site; a strike is not one of its legal missions."""
+    def test_an_illegal_striker_mission_is_repaired_not_rejected(self) -> None:
+        """A striker pointed at the wrong mission is remapped, not thrown away.
+
+        TGT-1 is an air-defence site (legal missions DEAD/SEAD/SEAD Sweep); a
+        Strike is not one of them. Rather than reject the package -- a mistake
+        the model makes repeatedly -- the flight is silently remapped to the
+        target's primary legal striking mission (DEAD), so the correctly-intended
+        order is kept. No rejection is recorded, mirroring the ground-transfer
+        auto-merge: the accepted plan is the audit trail.
+        """
 
         brief, caps = _context()
         payload = self._package_payload(
@@ -271,6 +279,85 @@ class TestAirTaskingCheatAttempts:
                 "target_id": "TGT-1",
                 "priority": 1,
                 "flights": [{"mission_type": "Strike", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert not rejections
+        assert plan is not None
+        assert len(plan.packages) == 1
+        flights = plan.packages[0].flights
+        assert len(flights) == 1
+        # Remapped to a mission that is actually legal for the objective.
+        assert flights[0].mission_type.value in ("DEAD", "SEAD", "SEAD Sweep")
+
+    def test_an_escort_led_package_with_an_illegal_striker_is_repaired(self) -> None:
+        """The two repairs combine: reorder the lead *and* remap the striker.
+
+        The model lists an escort first and gives its striker the wrong mission
+        for the target. Auto-repair promotes the striker to lead the package and
+        remaps its illegal mission to a legal one, keeping the escort as a
+        supporting flight. Nothing is rejected.
+        """
+
+        brief, caps = _context()
+        payload = self._package_payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [
+                    {"mission_type": "Escort", "aircraft_count": 2},
+                    {"mission_type": "Strike", "aircraft_count": 2},
+                ],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert not rejections
+        assert plan is not None
+        assert len(plan.packages) == 1
+        flights = plan.packages[0].flights
+        assert len(flights) == 2
+        # The striker now leads with a legal mission; the escort follows.
+        assert flights[0].mission_type.value in ("DEAD", "SEAD", "SEAD Sweep")
+        assert flights[1].mission_type.value == "Escort"
+
+    def test_a_package_of_only_escorts_is_rejected(self) -> None:
+        """Auto-repair cannot invent a striker; a package of only escorts dies.
+
+        This is the hard limit of the reorder repair: with no strike or attack
+        flight to lead the package, there is nothing to escort, so the package is
+        genuinely rejected rather than silently repaired.
+        """
+
+        brief, caps = _context()
+        payload = self._package_payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [{"mission_type": "Escort", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert "only escorts were provided" in _reasons(rejections)
+        assert plan is not None
+        assert not plan.packages
+
+    def test_an_area_mission_as_a_package_flight_is_rejected(self) -> None:
+        """Area missions patrol a slice of sky; they can never join a package.
+
+        Unlike a mistargeted striker, an area mission (BARCAP/TARCAP/Fighter
+        sweep) is not repaired into a strike -- it is rejected outright, because
+        it is not a strike against the objective at all.
+        """
+
+        brief, caps = _context()
+        payload = self._package_payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [{"mission_type": "BARCAP", "aircraft_count": 2}],
             },
         )
         plan, rejections = validate_air_tasking_plan(payload, brief, caps)
