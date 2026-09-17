@@ -725,9 +725,13 @@ class TestTransferLegality:
         assert result is None
         assert "no route from" in _reasons(rejections)
 
-    def test_moving_a_unit_that_is_not_at_the_origin_is_rejected(self) -> None:
+    def test_moving_a_unit_not_at_the_origin_is_silently_dropped(self) -> None:
         ctx = _context()
-        # BASE-1 holds RED-TANK and RED-ARTY, but no RED-TRUCK.
+        # BASE-1 holds RED-TANK and RED-ARTY, but no RED-TRUCK. The invented
+        # RED-TRUCK line is silently dropped (no rejection), mirroring the
+        # ground-transfer auto-merge: the model constantly invents inventory, so
+        # we bind whatever really exists and drop the rest. With RED-TRUCK the
+        # only unit in the order, the emptied transfer is skipped entirely.
         plan = _logistics(
             ctx,
             ground_transfers=(
@@ -739,12 +743,36 @@ class TestTransferLegality:
             ),
         )
         result, rejections = ctx.checker.check_logistics(plan)
+        # The invented line emitted no rejection; with nothing left to bind the
+        # empty plan falls back to automation (result is None) -- but crucially
+        # WITHOUT the old "has no RED-TRUCK to move" refusal cluttering the log.
+        assert not rejections
         assert result is None
-        assert "has no RED-TRUCK to move" in _reasons(rejections)
 
-    def test_a_transfer_is_clamped_to_what_is_present(self) -> None:
+    def test_an_invented_unit_is_dropped_but_a_real_one_still_moves(self) -> None:
         ctx = _context()
-        # BASE-1 holds 9 RED-TANK; asking for 20 is clamped to 9.
+        # BASE-1 holds RED-TANK but no RED-TRUCK. The invented RED-TRUCK line is
+        # silently dropped while the real RED-TANK line still binds.
+        plan = _logistics(
+            ctx,
+            ground_transfers=(
+                GroundTransferOrder(
+                    origin_base_id="BASE-1",
+                    destination_base_id="BASE-2",
+                    units=(("RED-TRUCK", 1), ("RED-TANK", 2)),
+                ),
+            ),
+        )
+        result, rejections = ctx.checker.check_logistics(plan)
+        assert result is not None
+        assert len(result.transfers) == 1
+        assert result.transfers[0].size == 2
+        assert not rejections
+
+    def test_a_transfer_is_silently_clamped_to_what_is_present(self) -> None:
+        ctx = _context()
+        # BASE-1 holds 9 RED-TANK; asking for 20 is silently reduced to 9 with no
+        # rejection -- the accepted transfer is the audit trail.
         plan = _logistics(
             ctx,
             ground_transfers=(
@@ -758,7 +786,26 @@ class TestTransferLegality:
         result, rejections = ctx.checker.check_logistics(plan)
         assert result is not None
         assert result.transfers[0].size == 9
-        assert "reduced from 20 to 9" in _reasons(rejections)
+        assert not rejections
+
+    def test_a_transfer_whose_origin_is_not_owned_is_still_rejected(self) -> None:
+        ctx = _context()
+        # A genuinely fatal problem -- the origin base is not RED's -- is still a
+        # real rejection: auto-repair only silences invented/over-quantity lines,
+        # never ownership or routing failures.
+        plan = _logistics(
+            ctx,
+            ground_transfers=(
+                GroundTransferOrder(
+                    origin_base_id="BASE-NOPE",
+                    destination_base_id="BASE-2",
+                    units=(("RED-TANK", 1),),
+                ),
+            ),
+        )
+        result, rejections = ctx.checker.check_logistics(plan)
+        assert result is None
+        assert "campaign state changed" in _reasons(rejections)
 
 
 # ---------------------------------------------------------------------------
@@ -828,3 +875,51 @@ class TestAirTaskingLegality:
         result, rejections = ctx.checker.check_air_tasking(_air_tasking(ctx, package))
         assert result is None
         assert "no flight in this package could be crewed" in _reasons(rejections)
+
+    def test_an_uncrewable_sead_escort_is_remapped_to_escort(self) -> None:
+        ctx = _context()
+        # No squadron can fly SEAD Escort, but plain Escort is crewable. The
+        # supporting escort is silently kept by remapping it to Escort, with no
+        # rejection, while the striker leads the package.
+        ctx.campaign.red.air_wing.auto_plannable = frozenset(
+            {FlightType.SEAD, FlightType.ESCORT}
+        )
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.SEAD, aircraft_count=2),
+                ProposedFlightOrder(
+                    mission_type=FlightType.SEAD_ESCORT, aircraft_count=2
+                ),
+            ),
+        )
+        result, rejections = ctx.checker.check_air_tasking(_air_tasking(ctx, package))
+        assert result is not None
+        assert "no squadron available" not in _reasons(rejections)
+        flights = result.packages[0].flights
+        assert flights[0].mission_type is FlightType.SEAD
+        assert flights[1].mission_type is FlightType.ESCORT
+
+    def test_an_uncrewable_escort_is_silently_dropped(self) -> None:
+        ctx = _context()
+        # Neither escort type is crewable this turn. The supporting escort is
+        # silently dropped -- no "no squadron available" rejection -- and the
+        # striker still flies the package on its own.
+        ctx.campaign.red.air_wing.auto_plannable = frozenset({FlightType.SEAD})
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.SEAD, aircraft_count=2),
+                ProposedFlightOrder(
+                    mission_type=FlightType.SEAD_ESCORT, aircraft_count=2
+                ),
+            ),
+        )
+        result, rejections = ctx.checker.check_air_tasking(_air_tasking(ctx, package))
+        assert result is not None
+        assert "no squadron available" not in _reasons(rejections)
+        flights = result.packages[0].flights
+        assert len(flights) == 1
+        assert flights[0].mission_type is FlightType.SEAD

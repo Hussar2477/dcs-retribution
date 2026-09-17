@@ -58,9 +58,12 @@ MAX_ENUMERATED_BASES = 40
 MAX_ENUMERATED_SQUADRONS = 40
 
 #: How many ground-unit types to list per base before summarising the rest. The model
-#: only needs to know which types are present so it does not try to transfer units a
-#: base does not hold; the top few by quantity carry that, and the remainder is noted.
-MAX_ENUMERATED_GROUND_TYPES = 4
+#: must see the FULL stock of each base to transfer units correctly -- listing only the
+#: top few led it to invent inventory and guess source bases. These are RED's OWN units
+#: at RED's OWN bases, so listing them in full is no data leak; the cap stays high enough
+#: to show every type a base realistically holds while still guarding a pathological base
+#: with an implausible variety behind a "(+N further types)" summary.
+MAX_ENUMERATED_GROUND_TYPES = 16
 
 #: Mission types the commander may request in an ACTIVE air tasking order. Deliberately
 #: excludes the mission families Retribution plans for itself or that make no sense

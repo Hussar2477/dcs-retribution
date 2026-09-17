@@ -37,7 +37,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from game.ai_commander.capabilities import CapabilityIndex
 from game.ai_commander.decision import Rejection
-from game.ai_commander.operations import OperationsBrief, OperationsResolver
+from game.ai_commander.operations import (
+    ESCORT_MISSION_TYPES,
+    OperationsBrief,
+    OperationsResolver,
+)
 from game.ai_commander.plan import (
     AirTaskingPlan,
     LogisticsPlan,
@@ -788,38 +792,26 @@ class PlanLegalityChecker:
             }
             bound: list[tuple[GroundUnitType, int]] = []
             for unit_id, requested in order.units:
+                # Auto-repair the transfer against what the origin base actually
+                # holds, silently, mirroring the ground-transfer auto-merge and
+                # the air-tasking reorder. The model repeatedly invents inventory
+                # -- moving a unit type the base does not hold, or more copies
+                # than are present -- but the intent (reinforce forward) is sound,
+                # so we bind whatever really exists and drop the rest WITHOUT a
+                # rejection. The accepted plan is the audit trail.
                 entry = by_id.get(unit_id)
                 if entry is None:
-                    rejections.append(
-                        Rejection(
-                            element,
-                            f"{origin.name} has no {unit_id} to move",
-                            unit_id,
-                        )
-                    )
+                    # Origin holds none of this unit type: silently skip the line.
                     continue
                 unit_type, available = entry
                 key = (id(origin), unit_id)
                 available -= spent.get(key, 0)
                 quantity = min(requested, available)
                 if quantity <= 0:
-                    rejections.append(
-                        Rejection(
-                            element,
-                            f"{origin.name} has no uncommitted {unit_id} left to move",
-                            unit_id,
-                        )
-                    )
+                    # Every present copy was already promised to an earlier
+                    # transfer this plan: silently skip.
                     continue
-                if quantity < requested:
-                    rejections.append(
-                        Rejection(
-                            element,
-                            f"reduced from {requested} to {quantity} by what is "
-                            f"actually present at {origin.name}",
-                            unit_id,
-                        )
-                    )
+                # quantity < requested is a silent reduction to what is present.
                 spent[key] = spent.get(key, 0) + quantity
                 bound.append((unit_type, quantity))
 
@@ -925,23 +917,42 @@ class PlanLegalityChecker:
     ) -> Optional[BoundFlight]:
         air_wing = self.coalition.air_wing
         can_plan = getattr(air_wing, "can_auto_plan", None)
-        if callable(can_plan):
+
+        def _planable(mission_type: FlightType) -> bool:
+            if not callable(can_plan):  # pragma: no cover - defensive
+                return True
             try:
-                planable = bool(can_plan(flight.mission_type))
+                return bool(can_plan(mission_type))
             except Exception:  # pragma: no cover - defensive
-                planable = True
-        else:  # pragma: no cover - defensive
-            planable = True
-        if not planable:
-            rejections.append(
-                Rejection(
-                    element,
-                    f"RED has no squadron available to fly {flight.mission_type.value} "
-                    f"this turn",
-                    flight.mission_type.value,
+                return True
+
+        mission_type = flight.mission_type
+        if not _planable(mission_type):
+            if mission_type in ESCORT_MISSION_TYPES:
+                # A supporting escort no RED squadron can crew is repaired
+                # silently, mirroring the air-tasking reorder/remap: if this is a
+                # SEAD Escort and a plain Escort can be crewed, keep the escort by
+                # remapping it; otherwise drop the escort flight WITHOUT a
+                # rejection. The striker still leads the package, so a leftover
+                # un-crewable escort no longer clutters the reject list.
+                if mission_type is FlightType.SEAD_ESCORT and _planable(
+                    FlightType.ESCORT
+                ):
+                    mission_type = FlightType.ESCORT
+                else:
+                    return None
+            else:
+                # A striker that cannot be crewed is a genuine rejection: the
+                # package loses the flight it was built around.
+                rejections.append(
+                    Rejection(
+                        element,
+                        f"RED has no squadron available to fly "
+                        f"{mission_type.value} this turn",
+                        mission_type.value,
+                    )
                 )
-            )
-            return None
+                return None
 
         if flight.aircraft_id is not None:
             entry = self.capabilities.aircraft_for(flight.aircraft_id)
@@ -966,7 +977,7 @@ class PlanLegalityChecker:
                 return None
 
         return BoundFlight(
-            mission_type=flight.mission_type,
+            mission_type=mission_type,
             aircraft_count=flight.aircraft_count,
             aircraft_id=flight.aircraft_id,
         )

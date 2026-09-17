@@ -21,7 +21,9 @@ import pytest
 
 from game.ai_commander.enums import IntelPolicy, TargetSetCategory
 from game.ai_commander.operations import (
+    MAX_ENUMERATED_GROUND_TYPES,
     OPERATIONS_SCHEMA_VERSION,
+    BaseView,
     OperationsBrief,
     OperationsProjector,
     TargetView,
@@ -224,3 +226,70 @@ class TestBriefIsAccurate:
         _, first = _brief()
         _, second = _brief()
         assert first.content_hash() == second.content_hash()
+
+
+class TestGroundInventoryIsListedInFull:
+    """The per-base ground breakdown must show the commander every type a base
+    really holds. Listing only the top few taught the model to invent inventory
+    and guess source bases, so the enumeration cap is deliberately generous;
+    these are RED's OWN units at RED's OWN bases, so full disclosure is no leak.
+    """
+
+    def _base(
+        self, ground_by_type: tuple[tuple[str, int], ...], truncated: int
+    ) -> BaseView:
+        return BaseView(
+            id="BASE-1",
+            name="Forward Depot",
+            kind="airbase",
+            is_front_line_base=True,
+            runway_operational=True,
+            runway_repairable=False,
+            runway_repair_turns_remaining=None,
+            aircraft_present=0,
+            aircraft_on_order=0,
+            parking_free=None,
+            ground_units_present=sum(count for _, count in ground_by_type),
+            ground_units_on_order=0,
+            ground_units_by_type=ground_by_type,
+            ground_types_truncated=truncated,
+            can_recruit_ground_units=True,
+            has_ground_unit_source=True,
+            squadron_ids=(),
+        )
+
+    def _project(
+        self, ranked: list[tuple[str, int]]
+    ) -> tuple[tuple[tuple[str, int], ...], int]:
+        # Mirror the projector's slice/summary so the test tracks real behaviour.
+        listed = tuple(ranked[:MAX_ENUMERATED_GROUND_TYPES])
+        truncated = max(0, len(ranked) - MAX_ENUMERATED_GROUND_TYPES)
+        return listed, truncated
+
+    def test_cap_is_generous_enough_for_a_realistic_armoury(self) -> None:
+        # A regression that dropped the cap back to a handful of types would
+        # reintroduce the invented-inventory behaviour this fix removes.
+        assert MAX_ENUMERATED_GROUND_TYPES >= 16
+
+    def test_every_type_of_a_ten_type_base_is_listed(self) -> None:
+        ranked = [(f"RED-UNIT-{i:02d}", 20 - i) for i in range(10)]
+        listed, truncated = self._project(ranked)
+        base = self._base(listed, truncated)
+        rendered = base.render()
+        # All ten distinct types are named in full, with no summarised remainder.
+        for name, count in ranked:
+            assert f"{name} x{count}" in rendered
+        assert "further types" not in rendered
+
+    def test_a_pathological_base_still_summarises_the_overflow(self) -> None:
+        # A base with more variety than the cap keeps the "(+N further types)"
+        # guard so a single freak base cannot bloat the prompt without bound.
+        ranked = [
+            (f"RED-UNIT-{i:02d}", 100 - i)
+            for i in range(MAX_ENUMERATED_GROUND_TYPES + 3)
+        ]
+        listed, truncated = self._project(ranked)
+        base = self._base(listed, truncated)
+        rendered = base.render()
+        assert truncated == 3
+        assert "(+3 further types)" in rendered
