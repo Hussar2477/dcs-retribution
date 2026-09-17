@@ -80,6 +80,42 @@ class TestAirTaskingBriefing:
         assert "OCA/Runway" in text
         assert "enemy_airbases" in text
 
+    def test_escort_may_not_be_primary_flight_rule_is_stated(self) -> None:
+        text = self._text()
+        # The 4th enforced rule: a package is led by a striker, escorts follow.
+        assert "Four rules the planner enforces" in text
+        assert "(4)" in text
+        assert "primary" in text
+        # Escort/SEAD Escort are supporting flights, not the lead.
+        assert "Escort" in text
+        assert "SEAD Escort" in text
+
+    def test_mission_type_from_missions_list_is_reinforced(self) -> None:
+        text = self._text()
+        # Rule (1): mission_type must come from the target's missions= list --
+        # the DEAD-on-a-Strike-target mistake is called out by name.
+        assert "missions=" in text
+        assert "DEAD" in text
+
+    def test_anti_ship_massing_doctrine_is_stated(self) -> None:
+        text = self._text()
+        assert "ANTI-SHIP MASSING" in text
+        assert "MASS" in text
+        # Multiple anti-ship flights, escort and SEAD escort, several targets.
+        assert "anti-ship" in text
+        assert "Escort" in text
+        assert "SEAD Escort" in text
+        # We must NOT claim the commander controls launch range/standoff.
+        assert "cannot set launch range" in text
+
+    def test_asap_timing_doctrine_is_stated(self) -> None:
+        text = self._text()
+        assert "TIMING" in text
+        assert "asap" in text
+        assert "asap:true" in text
+        # Priority/defensive packages launch early.
+        assert "CAS/BAI" in text
+
 
 class TestLogisticsBriefing:
     def _text(self) -> str:
@@ -108,6 +144,31 @@ class TestLogisticsBriefing:
         # Ground units can only be built where a factory stands.
         assert "factory" in text
         assert "recruit_ground=" in text
+
+    def test_commit_the_budget_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # A large surplus on a holdable front must be committed, not hoarded.
+        assert "COMMIT THE BUDGET" in text
+        assert "surplus" in text
+        assert "underspending" in text
+
+    def test_front_line_air_defence_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Buy AAA and transfer owned SAM/SHORAD/MANPADS forward to the front.
+        assert "FRONT-LINE AIR DEFENCE" in text
+        assert "AAA" in text
+        assert "SHORAD" in text
+        assert "MANPADS" in text
+        # Concrete, catalogue-plausible examples of each.
+        assert "ZSU-23-4" in text
+        assert "SA-15" in text
+
+    def test_forward_base_helicopters_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Short-radius attack helicopters must be forward-based near the front.
+        assert "FORWARD-BASE ATTACK HELICOPTERS" in text
+        assert "squadron_relocations" in text
+        assert "Mi-28N" in text
 
 
 class TestCommandBriefing:

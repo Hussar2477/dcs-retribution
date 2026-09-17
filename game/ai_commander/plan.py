@@ -834,8 +834,13 @@ def _validate_ground_transfers(
     rejections: list[Rejection],
 ) -> tuple[GroundTransferOrder, ...]:
     known_units = frozenset(capabilities.ground_unit_ids)
-    orders: list[GroundTransferOrder] = []
-    seen: set[tuple[str, str]] = set()
+    # Multiple transfer objects that share the same (origin, destination) are
+    # merged into a single order rather than rejected as duplicates: models
+    # routinely emit one object per unit type bound for the same base, and
+    # rejecting the repeats used to starve the front. ``merged`` preserves the
+    # first-seen order of destinations, and each per-key bucket preserves the
+    # first-seen order of unit types while summing quantities.
+    merged: dict[tuple[str, str], dict[str, int]] = {}
     for index, entry in enumerate(_entries(payload, "ground_transfers", rejections)):
         element = f"ground_transfers[{index}]"
         if not isinstance(entry, dict):
@@ -921,21 +926,23 @@ def _validate_ground_transfers(
             )
             continue
         key = (origin, destination)
-        if key in seen:
-            rejections.append(
-                Rejection(
-                    element=f"{element}.destination_base_id",
-                    reason="duplicate identifier",
-                    value=destination,
-                )
-            )
+        bucket = merged.setdefault(key, {})
+        for unit_id, quantity in units:
+            current = bucket.get(unit_id, 0)
+            if current == 0 and len(bucket) >= MAX_UNIT_TYPES_PER_TRANSFER:
+                # Distinct-type cap reached for this destination: drop the extra
+                # type rather than rejecting the whole (merged) transfer.
+                continue
+            bucket[unit_id] = min(current + quantity, MAX_QUANTITY_PER_ORDER)
+    orders: list[GroundTransferOrder] = []
+    for (origin, destination), bucket in merged.items():
+        if not bucket:
             continue
-        seen.add(key)
         orders.append(
             GroundTransferOrder(
                 origin_base_id=origin,
                 destination_base_id=destination,
-                units=tuple(units),
+                units=tuple(bucket.items()),
             )
         )
     return tuple(orders)
