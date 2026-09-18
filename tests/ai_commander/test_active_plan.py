@@ -27,10 +27,17 @@ from game.ai_commander.capabilities import (
     CapabilityIndex,
     capability_index_for,
 )
-from game.ai_commander.enums import IntelPolicy
-from game.ai_commander.operations import OperationsBrief, OperationsProjector
+from game.ato.flighttype import FlightType
+from game.ai_commander.enums import IntelPolicy, TargetSetCategory
+from game.ai_commander.operations import (
+    OperationsBrief,
+    OperationsProjector,
+    TargetView,
+)
 from game.ai_commander.plan import (
     MAX_QUANTITY_PER_ORDER,
+    ProposedFlightOrder,
+    _is_time_critical,
     example_air_tasking_json,
     example_logistics_json,
     validate_air_tasking_plan,
@@ -321,6 +328,51 @@ class TestAirTaskingCheatAttempts:
         assert flights[0].mission_type.value in ("DEAD", "SEAD", "SEAD Sweep")
         assert flights[1].mission_type.value == "Escort"
 
+    def test_an_airbase_strike_on_a_carrier_is_remapped_to_anti_ship(self) -> None:
+        """A carrier is projected as shipping, so OCA is repaired to Anti-ship.
+
+        The model treats a carrier like a land airbase and orders OCA/Aircraft
+        against it. Because the carrier is projected as a shipping target whose
+        only legal mission is Anti-ship, the illegal-mission repair silently
+        remaps the flight to Anti-ship rather than letting the package die at
+        execution ("... is not valid for OCA/Aircraft missions").
+        """
+
+        campaign, game = fakes.synthetic_game()
+        carrier = fakes.make_control_point(
+            cp_id=99,
+            name="CVN-75 Harry S. Truman",
+            captured=fakes.Player.BLUE,
+            position=fakes.point(35_000.0, 0.0),
+        )
+        setattr(carrier, "is_carrier", True)
+        game.theater.controlpoints.append(carrier)
+        brief = OperationsProjector(game, IntelPolicy.FULL_PARITY).project(
+            "hash", "rev-1"
+        )
+        caps = capability_index_for(campaign.red)
+        carrier_id = next(
+            target_id
+            for target_id in sorted(brief.target_ids)
+            if (target := brief.target(target_id)) is not None
+            and "CVN-75" in target.label
+        )
+        payload = self._package_payload(
+            brief,
+            {
+                "target_id": carrier_id,
+                "priority": 1,
+                "flights": [{"mission_type": "OCA/Aircraft", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert not rejections
+        assert plan is not None
+        assert len(plan.packages) == 1
+        flights = plan.packages[0].flights
+        assert len(flights) == 1
+        assert flights[0].mission_type.value == "Anti-ship"
+
     def test_a_package_of_only_escorts_is_rejected(self) -> None:
         """Auto-repair cannot invent a striker; a package of only escorts dies.
 
@@ -419,3 +471,184 @@ class TestAirTaskingCheatAttempts:
         assert len(plan.packages) == 1
         assert plan.packages[0].target_id == "TGT-1"
         assert "is not in the brief" in _reasons(rejections)
+
+
+class TestTimeCriticalPackagesLaunchAsap:
+    """Front-line and defensive packages must launch before the ground battle is
+    decided. The model repeatedly leaves such packages un-flagged, so ``asap`` is
+    forced on for them in the validator regardless of what the model wrote.
+    """
+
+    def _payload(
+        self, brief: OperationsBrief, package: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "red-commander-air-tasking/1",
+            "turn_id": brief.turn_id,
+            "campaign_revision": brief.campaign_revision,
+            "intent": "test",
+            "packages": [package],
+        }
+
+    def test_a_defensive_mission_is_forced_asap(self) -> None:
+        # TGT-1 is an air-defence site; a DEAD package against it is defensive,
+        # so it is launched as early as possible even though asap was left false.
+        brief, caps = _context()
+        payload = self._payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "asap": False,
+                "flights": [{"mission_type": "DEAD", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert not rejections
+        assert plan is not None
+        assert plan.packages[0].asap is True
+
+    def test_a_non_time_critical_package_keeps_its_flag(self) -> None:
+        # TGT-3 is a land airbase; an OCA strike on it is not front-line or
+        # defensive, so the model's own asap:false choice is respected.
+        brief, caps = _context()
+        payload = self._payload(
+            brief,
+            {
+                "target_id": "TGT-3",
+                "priority": 1,
+                "asap": False,
+                "flights": [{"mission_type": "OCA/Aircraft", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert not rejections
+        assert plan is not None
+        assert plan.packages[0].asap is False
+
+    def test_an_explicit_asap_is_never_downgraded(self) -> None:
+        # A model that does flag an offensive package keeps its asap:true.
+        brief, caps = _context()
+        payload = self._payload(
+            brief,
+            {
+                "target_id": "TGT-3",
+                "priority": 1,
+                "asap": True,
+                "flights": [{"mission_type": "OCA/Aircraft", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert plan is not None
+        assert plan.packages[0].asap is True
+
+    def test_a_front_target_is_time_critical_for_any_mission(self) -> None:
+        # A strike against reinforcements is time-critical whatever mission flies
+        # it: the convoy is only worth hitting before it reaches the front.
+        target = TargetView(
+            id="TGT-9",
+            category=TargetSetCategory.ENEMY_REINFORCEMENTS,
+            label="road convoy",
+            near="BASE-1",
+            threatens_own_forces=True,
+            legal_missions=("BAI",),
+        )
+        strike = ProposedFlightOrder(mission_type=FlightType.STRIKE, aircraft_count=2)
+        assert _is_time_critical(target, [strike]) is True
+
+    def test_a_rear_strike_is_not_time_critical(self) -> None:
+        target = TargetView(
+            id="TGT-9",
+            category=TargetSetCategory.ENEMY_INFRASTRUCTURE,
+            label="oil depot",
+            near="BASE-1",
+            threatens_own_forces=False,
+            legal_missions=("Strike",),
+        )
+        strike = ProposedFlightOrder(mission_type=FlightType.STRIKE, aircraft_count=2)
+        assert _is_time_critical(target, [strike]) is False
+
+
+class TestIngressAltitudeBands:
+    """A flight may carry an optional ingress band biasing its run altitude.
+
+    The band is the one altitude lever the commander is given. A recognised
+    value is threaded through to the flight order; an unrecognised one is the
+    most benign kind of mistake -- it only ever affected altitude within the
+    doctrine clamp -- so it is silently dropped to the default profile rather
+    than costing the flight a rejection.
+    """
+
+    def _payload(
+        self, brief: OperationsBrief, package: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": "red-commander-air-tasking/1",
+            "turn_id": brief.turn_id,
+            "campaign_revision": brief.campaign_revision,
+            "intent": "test",
+            "packages": [package],
+        }
+
+    def test_a_recognised_ingress_band_is_carried_through(self) -> None:
+        brief, caps = _context()
+        payload = self._payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [
+                    {"mission_type": "DEAD", "aircraft_count": 2, "ingress": "low"}
+                ],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert not rejections
+        assert plan is not None
+        assert plan.packages[0].flights[0].ingress == "low"
+
+    def test_an_unrecognised_ingress_band_is_dropped_silently(self) -> None:
+        brief, caps = _context()
+        payload = self._payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [
+                    {
+                        "mission_type": "DEAD",
+                        "aircraft_count": 2,
+                        "ingress": "stratospheric",
+                    }
+                ],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        # No rejection: the good flight survives with the default (None) profile.
+        assert not rejections
+        assert plan is not None
+        assert plan.packages[0].flights[0].ingress is None
+
+    def test_a_missing_ingress_band_defaults_to_none(self) -> None:
+        brief, caps = _context()
+        payload = self._payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [{"mission_type": "DEAD", "aircraft_count": 2}],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert plan is not None
+        assert plan.packages[0].flights[0].ingress is None
+
+    def test_the_ingress_band_appears_in_the_schema(self) -> None:
+        from game.ai_commander.plan import INGRESS_BANDS, air_tasking_json_schema
+
+        brief, caps = _context()
+        schema = air_tasking_json_schema(brief, caps)
+        flight_schema = schema["properties"]["packages"]["items"]["properties"][
+            "flights"
+        ]["items"]["properties"]
+        assert flight_schema["ingress"]["enum"] == list(INGRESS_BANDS)

@@ -74,13 +74,20 @@ class WaypointBuilder:
         return self.get_altitude(self.flight.unit_type.preferred_combat_altitude)
 
     def get_altitude(self, alt: Distance) -> Distance:
+        if self.flight.is_helo:
+            return feet(self.settings.heli_combat_alt_agl)
         randomized_alt = feet(round(alt.feet + self.flight.plane_altitude_offset))
-        altitude = max(
+        # An optional RED AI commander ingress band biases the base altitude toward
+        # the low or high end of the doctrine envelope; the result is always
+        # re-clamped so it can never fall outside [min, max] combat altitude.
+        band = getattr(self.flight, "ingress_band", None)
+        if band == "low":
+            randomized_alt = self.doctrine.min_combat_altitude
+        elif band == "high":
+            randomized_alt = self.doctrine.max_combat_altitude
+        return max(
             self.doctrine.min_combat_altitude,
             min(self.doctrine.max_combat_altitude, randomized_alt),
-        )
-        return (
-            feet(self.settings.heli_combat_alt_agl) if self.flight.is_helo else altitude
         )
 
     def takeoff(self, departure: ControlPoint) -> FlightWaypoint:

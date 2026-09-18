@@ -923,3 +923,65 @@ class TestAirTaskingLegality:
         flights = result.packages[0].flights
         assert len(flights) == 1
         assert flights[0].mission_type is FlightType.SEAD
+
+    def test_an_uncrewable_anti_ship_mission_auto_enables_a_capable_squadron(
+        self,
+    ) -> None:
+        ctx = _context()
+        # RED owns an Anti-ship-capable squadron, but no squadron is set
+        # auto-assignable for Anti-ship, so the air wing refuses to plan it --
+        # exactly the failure seen in the playtest. The legality checker should
+        # silently switch the capable squadron on rather than reject the flight.
+        striker = ctx.campaign.red.air_wing.squadrons[1]
+        striker.capable_tasks = frozenset(striker.capable_tasks | {FlightType.ANTISHIP})
+        assert not ctx.campaign.red.air_wing.can_auto_plan(FlightType.ANTISHIP)
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.ANTISHIP, aircraft_count=2),
+            ),
+        )
+        result, rejections = ctx.checker.check_air_tasking(_air_tasking(ctx, package))
+        assert result is not None
+        assert "no squadron available" not in _reasons(rejections)
+        assert result.packages[0].flights[0].mission_type is FlightType.ANTISHIP
+        # The capable squadron was silently made auto-assignable for Anti-ship.
+        assert FlightType.ANTISHIP in striker.auto_assignable_mission_types
+        assert ctx.campaign.red.air_wing.can_auto_plan(FlightType.ANTISHIP)
+
+    def test_auto_enable_prefers_the_best_stocked_capable_squadron(self) -> None:
+        ctx = _context()
+        # Both squadrons can fly Anti-ship; the one with the deeper bench of
+        # on-hand aircraft (RED SQN 1, 8 aircraft vs RED SQN 2, 4) is chosen.
+        sqn1, sqn2 = ctx.campaign.red.air_wing.squadrons
+        sqn1.capable_tasks = frozenset(sqn1.capable_tasks | {FlightType.ANTISHIP})
+        sqn2.capable_tasks = frozenset(sqn2.capable_tasks | {FlightType.ANTISHIP})
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.ANTISHIP, aircraft_count=2),
+            ),
+        )
+        result, rejections = ctx.checker.check_air_tasking(_air_tasking(ctx, package))
+        assert result is not None
+        assert FlightType.ANTISHIP in sqn1.auto_assignable_mission_types
+        assert FlightType.ANTISHIP not in sqn2.auto_assignable_mission_types
+
+    def test_an_anti_ship_mission_with_no_capable_squadron_is_still_rejected(
+        self,
+    ) -> None:
+        ctx = _context()
+        # No RED squadron is capable of Anti-ship, so there is nothing to
+        # enable and the flight is genuinely refused.
+        package = ProposedPackageOrder(
+            target_id="TGT-1",
+            priority=1,
+            flights=(
+                ProposedFlightOrder(mission_type=FlightType.ANTISHIP, aircraft_count=2),
+            ),
+        )
+        result, rejections = ctx.checker.check_air_tasking(_air_tasking(ctx, package))
+        assert result is None
+        assert "no squadron available to fly Anti-ship" in _reasons(rejections)

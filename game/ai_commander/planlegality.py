@@ -162,6 +162,9 @@ class BoundFlight:
     mission_type: FlightType
     aircraft_count: int
     aircraft_id: Optional[str]
+    #: Optional ingress-altitude band ("low"|"medium"|"high"), carried through to
+    #: execution so it can bias the flight's altitude within the doctrine clamp.
+    ingress: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -909,6 +912,50 @@ class PlanLegalityChecker:
             asap=package.asap,
         )
 
+    def _auto_enable_squadron(self, mission_type: FlightType) -> bool:
+        """Silently make the best-stocked capable RED squadron auto-assignable
+        for ``mission_type``, returning True if one was enabled.
+
+        The model repeatedly tasks missions RED owns capable airframes for --
+        Anti-ship above all, and helicopter CAS/BAI -- that no squadron happens
+        to be set auto-assignable for, so ``can_auto_plan`` refuses them even
+        though the aircraft are sitting on the ramp. Flipping a RED squadron's
+        own auto-assignable flag is exactly what the human commander does from
+        the squadron menu: it touches only RED's coalition, reveals nothing
+        about BLUE and lets the aircraft fly. So, mirroring the existing
+        ground-transfer and escort repairs, it is done silently rather than
+        refused. The squadron with the most capable aircraft on hand is chosen
+        so the mission is crewed from the deepest bench.
+        """
+
+        air_wing = self.coalition.air_wing
+        iter_squadrons = getattr(air_wing, "iter_squadrons", None)
+        if not callable(iter_squadrons):  # pragma: no cover - defensive
+            return False
+        best: Optional[Squadron] = None
+        best_stock = 0
+        try:
+            for squadron in iter_squadrons():
+                if not squadron.capable_of(mission_type):
+                    continue
+                stock = int(getattr(squadron, "owned_aircraft", 0) or 0)
+                if stock <= 0:
+                    continue
+                if stock > best_stock:
+                    best = squadron
+                    best_stock = stock
+        except Exception:  # pragma: no cover - defensive
+            return False
+        if best is None:
+            return False
+        try:
+            best.set_auto_assignable_mission_types(
+                set(best.auto_assignable_mission_types) | {mission_type}
+            )
+        except Exception:  # pragma: no cover - defensive
+            return False
+        return True
+
     def _check_flight(
         self,
         element: str,
@@ -926,8 +973,18 @@ class PlanLegalityChecker:
             except Exception:  # pragma: no cover - defensive
                 return True
 
+        def _ensure_planable(mission_type: FlightType) -> bool:
+            # Try the air wing as it stands, then, if it refuses, silently enable
+            # a capable RED squadron and ask again. Only a mission no RED
+            # squadron can crew at all remains unplannable.
+            if _planable(mission_type):
+                return True
+            if self._auto_enable_squadron(mission_type):
+                return _planable(mission_type)
+            return False
+
         mission_type = flight.mission_type
-        if not _planable(mission_type):
+        if not _ensure_planable(mission_type):
             if mission_type in ESCORT_MISSION_TYPES:
                 # A supporting escort no RED squadron can crew is repaired
                 # silently, mirroring the air-tasking reorder/remap: if this is a
@@ -935,7 +992,7 @@ class PlanLegalityChecker:
                 # remapping it; otherwise drop the escort flight WITHOUT a
                 # rejection. The striker still leads the package, so a leftover
                 # un-crewable escort no longer clutters the reject list.
-                if mission_type is FlightType.SEAD_ESCORT and _planable(
+                if mission_type is FlightType.SEAD_ESCORT and _ensure_planable(
                     FlightType.ESCORT
                 ):
                     mission_type = FlightType.ESCORT
@@ -980,4 +1037,5 @@ class PlanLegalityChecker:
             mission_type=mission_type,
             aircraft_count=flight.aircraft_count,
             aircraft_id=flight.aircraft_id,
+            ingress=flight.ingress,
         )

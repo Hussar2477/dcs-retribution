@@ -414,6 +414,35 @@ class TestDecisionLogIsAuditable:
             assert rejection["element"]
             assert rejection["reason"]
 
+    def test_the_summary_surfaces_refused_mission_types(self) -> None:
+        # A rejection whose element names a mission_type carries the refused
+        # mission TYPE in its value; the next turn's brief must learn from it.
+        payload = {
+            "turn_id": 22,
+            "accepted_directive": {"strategy": "offensive"},
+            "rejections": [
+                {
+                    "element": "packages[0].flights[0].mission_type",
+                    "reason": "this mission type cannot be flown against "
+                    "this objective",
+                    "value": "OCA/Runway",
+                },
+                {
+                    "element": "assignments[1].mission_types[0]",
+                    "reason": "this squadron's airframe cannot fly this "
+                    "mission type",
+                    "value": "Anti-ship",
+                },
+                {"element": "packages[0].target_id", "value": "TGT-1"},
+            ],
+        }
+
+        summary = summary_from_payload(payload)
+
+        assert summary.refused_mission_types == ("OCA/Runway", "Anti-ship")
+        # A non-mission rejection value is never mistaken for a mission type.
+        assert "TGT-1" not in summary.refused_mission_types
+
     def test_the_key_is_never_written_into_the_decision_log(
         self, tmp_path: Path
     ) -> None:

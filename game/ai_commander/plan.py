@@ -35,10 +35,12 @@ from game.ato.flighttype import FlightType
 
 from .capabilities import CapabilityIndex
 from .decision import MAX_LIST_ENTRIES, Rejection
+from .enums import TargetSetCategory
 from .operations import (
     ESCORT_MISSION_TYPES,
     PLANNABLE_MISSION_TYPES,
     OperationsBrief,
+    TargetView,
 )
 
 #: Bumped whenever the wire format of a stage changes.
@@ -57,6 +59,12 @@ MAX_UNIT_TYPES_PER_TRANSFER = 8
 MAX_INTENT_CHARACTERS = 400
 
 _MISSION_BY_VALUE: dict[str, FlightType] = {t.value: t for t in PLANNABLE_MISSION_TYPES}
+
+#: Optional ingress-altitude bands the commander may request per flight. They
+#: only bias the strike run within the faction's own doctrine altitude clamp --
+#: never outside it -- and are ignored for helicopters, which always fly their
+#: own AGL profile. An unrecognised value is dropped silently (no rejection).
+INGRESS_BANDS: tuple[str, ...] = ("low", "medium", "high")
 
 #: Area missions patrol a slice of sky and are never flown against a specific
 #: target, so they can never lead or even join a target package. They are dropped
@@ -110,6 +118,51 @@ def _primary_striker_mission(legal_missions: Sequence[str]) -> Optional[FlightTy
         ):
             return candidate
     return None
+
+
+#: Mission types that support the ground battle directly. A package built around
+#: one of these must arrive while the battle is still being fought, so it is
+#: launched as soon as possible even when the model left ``asap`` unset.
+_TIME_CRITICAL_MISSION_TYPES: frozenset[FlightType] = frozenset(
+    {
+        FlightType.CAS,
+        FlightType.BAI,
+        FlightType.DEAD,
+        FlightType.SEAD,
+        FlightType.SEAD_SWEEP,
+    }
+)
+
+#: Target categories that sit on or feed the front line. A strike against one is
+#: time-critical regardless of the mission flown, because the reinforcements or
+#: battle position it hits are only worth striking before they reach the fight.
+_FRONT_TARGET_CATEGORIES: frozenset[TargetSetCategory] = frozenset(
+    {
+        TargetSetCategory.ENEMY_REINFORCEMENTS,
+        TargetSetCategory.ENEMY_BATTLE_POSITIONS,
+        TargetSetCategory.BASE_CAPTURE,
+        TargetSetCategory.BASE_DEFENCE,
+    }
+)
+
+
+def _is_time_critical(
+    target: TargetView, flights: Sequence[ProposedFlightOrder]
+) -> bool:
+    """Whether a package must launch as soon as possible.
+
+    A front-line or defensive package (close air support, battlefield
+    interdiction, escorting SEAD/DEAD, or any strike against front-line troops
+    and their reinforcements) has to be in the air before the ground battle is
+    decided. The model repeatedly leaves such packages un-flagged, so the launch
+    timing is forced here rather than trusted to it.
+    """
+
+    if target.category in _FRONT_TARGET_CATEGORIES:
+        return True
+    return any(
+        flight.mission_type in _TIME_CRITICAL_MISSION_TYPES for flight in flights
+    )
 
 
 @unique
@@ -324,10 +377,14 @@ class ProposedFlightOrder:
     #: Optional preferred airframe. ``None`` lets Retribution's own squadron selection
     #: pick the best available airframe, which is usually the better outcome.
     aircraft_id: Optional[str] = None
+    #: Optional ingress-altitude band ("low"|"medium"|"high"); biases the strike
+    #: run within the doctrine altitude clamp. ``None`` keeps the default profile.
+    ingress: Optional[str] = None
 
     def describe(self) -> str:
         airframe = f" ({self.aircraft_id})" if self.aircraft_id else ""
-        return f"{self.aircraft_count}x {self.mission_type.value}{airframe}"
+        ingress = f" @{self.ingress}" if self.ingress else ""
+        return f"{self.aircraft_count}x {self.mission_type.value}{airframe}{ingress}"
 
 
 @dataclass(frozen=True)
@@ -383,6 +440,7 @@ class AirTaskingPlan:
                             "mission_type": flight.mission_type.value,
                             "aircraft_count": flight.aircraft_count,
                             "aircraft_id": flight.aircraft_id,
+                            "ingress": flight.ingress,
                         }
                         for flight in package.flights
                     ],
@@ -1114,6 +1172,8 @@ def validate_air_tasking_plan(
         if not isinstance(priority, int) or isinstance(priority, bool) or priority < 1:
             priority = index + 1
         asap = bool(entry.get("asap", False))
+        if not asap and _is_time_critical(target, flights):
+            asap = True
 
         seen_targets.add(target_id)
         packages.append(
@@ -1252,11 +1312,21 @@ def _validate_flights(
                     )
                 )
                 continue
+        raw_ingress = raw.get("ingress")
+        # An ingress band only ever biases altitude inside the doctrine clamp, so
+        # an unrecognised value is harmless: drop it silently to the default
+        # profile rather than rejecting an otherwise good flight.
+        ingress = (
+            raw_ingress
+            if isinstance(raw_ingress, str) and raw_ingress in INGRESS_BANDS
+            else None
+        )
         flights.append(
             ProposedFlightOrder(
                 mission_type=mission,
                 aircraft_count=count,
                 aircraft_id=aircraft_id if isinstance(aircraft_id, str) else None,
+                ingress=ingress,
             )
         )
     return flights
@@ -1436,6 +1506,7 @@ def air_tasking_json_schema(
                                         "maximum": MAX_AIRCRAFT_PER_FLIGHT,
                                     },
                                     "aircraft_id": {"enum": airframes},
+                                    "ingress": {"enum": list(INGRESS_BANDS)},
                                 },
                             },
                         },

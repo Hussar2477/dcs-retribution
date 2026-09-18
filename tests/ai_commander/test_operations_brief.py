@@ -20,6 +20,7 @@ from typing import cast
 import pytest
 
 from game.ai_commander.enums import IntelPolicy, TargetSetCategory
+from game.theater.player import Player
 from game.ai_commander.operations import (
     MAX_ENUMERATED_GROUND_TYPES,
     OPERATIONS_SCHEMA_VERSION,
@@ -293,3 +294,65 @@ class TestGroundInventoryIsListedInFull:
         rendered = base.render()
         assert truncated == 3
         assert "(+3 further types)" in rendered
+
+
+class TestShipTargetsOfferOnlyAntiShip:
+    """A carrier or amphibious ship is an enemy control point, so the objective
+    finder lists it among the enemy airbases. Offering it OCA/Aircraft the way a
+    land airbase is offered gets the package refused at execution ("... is not
+    valid for OCA/Aircraft missions"), so a ship control point must be projected
+    as shipping, attackable only with Anti-ship.
+    """
+
+    def _carrier_brief(
+        self, monkeypatch: pytest.MonkeyPatch, **ship_flags: bool
+    ) -> tuple[fakes.SyntheticCampaign, OperationsBrief]:
+        fakes.patch_objective_finder(monkeypatch)
+        campaign, game = fakes.synthetic_game()
+        carrier = fakes.make_control_point(
+            cp_id=99,
+            name="CVN-75 Harry S. Truman",
+            captured=Player.BLUE,
+            position=fakes.point(35_000.0, 0.0),
+        )
+        for flag, value in ship_flags.items():
+            setattr(carrier, flag, value)
+        game.theater.controlpoints.append(carrier)
+        brief = OperationsProjector(game, IntelPolicy.FULL_PARITY).project(
+            "campaign-hash", "rev-1"
+        )
+        return campaign, brief
+
+    def _carrier_target(self, brief: OperationsBrief) -> TargetView:
+        for target_id in sorted(brief.target_ids):
+            target = brief.target(target_id)
+            if target is not None and "CVN-75" in target.label:
+                return target
+        raise AssertionError("the carrier was not projected as a target")
+
+    def test_a_carrier_is_projected_as_shipping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, brief = self._carrier_brief(monkeypatch, is_carrier=True)
+        carrier = self._carrier_target(brief)
+        assert carrier.category is TargetSetCategory.ENEMY_SHIPPING
+        assert set(carrier.legal_missions) == {"Anti-ship"}
+        assert "OCA/Aircraft" not in carrier.legal_missions
+
+    def test_an_lha_is_also_projected_as_shipping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, brief = self._carrier_brief(monkeypatch, is_lha=True)
+        assert self._carrier_target(brief).category is (
+            TargetSetCategory.ENEMY_SHIPPING
+        )
+
+    def test_a_land_airbase_still_offers_oca(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The reclassification must not touch ordinary land airbases: an enemy
+        # control point that is not a ship keeps its OCA missions.
+        _, brief = self._carrier_brief(monkeypatch)
+        carrier = self._carrier_target(brief)
+        assert carrier.category is TargetSetCategory.ENEMY_AIRBASES
+        assert set(carrier.legal_missions) == {"OCA/Aircraft", "OCA/Runway"}

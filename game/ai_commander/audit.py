@@ -606,9 +606,25 @@ def summary_from_payload(payload: Mapping[str, Any]) -> PriorTurnSummary:
     )
     rejections: Iterable[Any] = payload.get("rejections") or ()
     rejected: list[str] = []
+    refused_missions: list[str] = []
     for item in rejections:
-        if isinstance(item, Mapping) and item.get("element"):
-            rejected.append(str(item["element"]))
+        if not isinstance(item, Mapping):
+            continue
+        element = item.get("element")
+        if element:
+            rejected.append(str(element))
+        # A rejection whose element path names a mission_type carries the
+        # refused mission TYPE in its value; surface those so the next turn
+        # learns which mission choices were plainly illegal. Types only.
+        value = item.get("value")
+        if (
+            isinstance(element, str)
+            and "mission_type" in element
+            and isinstance(value, str)
+            and value.strip()
+            and value.strip() not in refused_missions
+        ):
+            refused_missions.append(value.strip())
     postures = directive.get("front_postures")
     return PriorTurnSummary(
         turn=int(payload.get("turn_id") or 0),
@@ -625,6 +641,7 @@ def summary_from_payload(payload: Mapping[str, Any]) -> PriorTurnSummary:
         ),
         rejected_element_count=len(rejected),
         rejected_elements=tuple(rejected[:8]),
+        refused_mission_types=tuple(refused_missions[:4]),
         fallback_reason=(
             str(payload["fallback_reason"]) if payload.get("fallback_reason") else None
         ),

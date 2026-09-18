@@ -543,6 +543,20 @@ class OperationsProjector:
                 continue
         return False
 
+    @staticmethod
+    def _is_ship(control_point: Any) -> bool:
+        """True when an enemy control point is really a ship.
+
+        A carrier, LHA or fleet control point can base aircraft, so the objective
+        finder lists it among the enemy airbases, but only an Anti-ship mission
+        can legally be flown against it.
+        """
+
+        return any(
+            bool(getattr(control_point, attribute, False))
+            for attribute in ("is_carrier", "is_lha", "is_fleet")
+        )
+
     def _base_kind(self, control_point: Any) -> str:
         for attribute, label in (
             ("is_carrier", "carrier"),
@@ -871,7 +885,20 @@ class OperationsProjector:
                 distance = self._closest_own_distance(position, own)
                 if distance is None:
                     continue
-                ranked.append((distance, category, objective, note))
+                # A carrier or amphibious ship is an enemy control point (aircraft
+                # can be based on it), so ObjectiveFinder lists it among the enemy
+                # airbases. It is still a ship: only an Anti-ship mission can be
+                # flown against it, and an airbase strike such as OCA/Aircraft
+                # fails at execution ("... is not valid for OCA/Aircraft missions").
+                # Re-categorise it as shipping so the brief offers the correct
+                # mission and any airbase-strike order the model still writes is
+                # auto-repaired to Anti-ship by the air-tasking validator.
+                target_category = category
+                if category is TargetSetCategory.ENEMY_AIRBASES and self._is_ship(
+                    objective
+                ):
+                    target_category = TargetSetCategory.ENEMY_SHIPPING
+                ranked.append((distance, target_category, objective, note))
 
         ranked.sort(key=lambda entry: (entry[0], entry[1].value, str(entry[2])))
         views: list[TargetView] = []

@@ -436,6 +436,11 @@ class FakeSquadron:
         self.relocations.append(None)
         self.destination = None
 
+    def can_auto_assign(self, task: FlightType) -> bool:
+        # Mirrors the real squadron: auto-assignability is gated on the
+        # auto-assignable set, NOT merely on capability.
+        return task in self.auto_assignable_mission_types
+
     def set_auto_assignable_mission_types(self, mission_types: Any) -> None:
         # The real squadron filters through ``capable_of``, so the fake does too:
         # a test must not be able to prove that an incapable task was accepted.
@@ -461,7 +466,11 @@ class FakeAirWing:
     def can_auto_plan(self, task: FlightType) -> bool:
         if self.auto_plannable:
             return task in self.auto_plannable
-        return any(squadron.capable_of(task) for squadron in self.squadrons)
+        # Mirrors the real air wing: a task is auto-plannable only if some
+        # squadron is set auto-assignable for it (not merely capable). The
+        # legality checker's silent auto-enable is what flips a capable-but-
+        # unassigned squadron on, so this must track the assignable set.
+        return any(squadron.can_auto_assign(task) for squadron in self.squadrons)
 
     @property
     def size(self) -> int:

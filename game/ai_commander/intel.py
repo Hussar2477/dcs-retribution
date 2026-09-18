@@ -193,6 +193,10 @@ class PriorTurnSummary:
     rejected_element_count: int = 0
     #: A few rejected element paths, so the model can learn what not to repeat.
     rejected_elements: tuple[str, ...] = ()
+    #: Mission TYPES the commander tried last turn that were refused outright
+    #: (an illegal or airframe-incapable choice), so the next air tasking can
+    #: avoid repeating them. Types only -- never enemy numbers or strengths.
+    refused_mission_types: tuple[str, ...] = ()
     fallback_reason: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -654,6 +658,13 @@ class RedCommanderBrief:
                 lines.append(f"posture {encoded}: {posture}")
             if prior.rejected_elements:
                 lines.append("refused last turn: " + ", ".join(prior.rejected_elements))
+            if prior.refused_mission_types:
+                lines.append(
+                    "mission types refused last turn: "
+                    + ", ".join(prior.refused_mission_types)
+                    + " -- do not simply repeat them; either fly a mission the "
+                    "target actually allows, or commit a massed, escorted package."
+                )
             if prior.intent:
                 lines.append(f"intent: {prior.intent}")
 

@@ -290,6 +290,7 @@ class PlanExecutor:
                     num_aircraft=flight.aircraft_count,
                     escort_type=escort_type,
                     preferred_type=self._aircraft_named(flight.aircraft_id),
+                    ingress_band=flight.ingress,
                 )
             )
 

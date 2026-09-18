@@ -10,8 +10,12 @@ history is entirely RED's own past decisions).
 
 from __future__ import annotations
 
+from game.ai_commander.activeprompt import build_stage_user_prompt
+from game.ai_commander.capabilities import capability_index_for
 from game.ai_commander.enums import IntelPolicy
 from game.ai_commander.intel import IntelProjector, PriorTurnSummary
+from game.ai_commander.operations import OperationsProjector
+from game.ai_commander.plan import CommanderStage
 from tests.ai_commander import fakes
 
 
@@ -64,6 +68,57 @@ class TestRecentTurnsRendering:
         _, game = fakes.synthetic_game()
         brief = IntelProjector(game, IntelPolicy.REALISTIC).project(
             recent_decisions=_recent()
+        )
+        blob = fakes.serialise_everything(brief.to_dict(), brief.render_compact())
+        assert fakes.blue_leaks_in(blob) == []
+
+
+class TestRefusedMissionTypesLearning:
+    """Mission types the commander was refused last turn must be surfaced so the
+    next air tasking stops re-offering a plainly-illegal choice."""
+
+    def _prior(self) -> PriorTurnSummary:
+        return PriorTurnSummary(
+            turn=21,
+            strategy="offensive",
+            reserve_policy="aggressive",
+            refused_mission_types=("Anti-ship", "OCA/Runway"),
+        )
+
+    def test_refused_mission_types_render_in_the_last_turn_block(self) -> None:
+        _, game = fakes.synthetic_game()
+        brief = IntelProjector(game, IntelPolicy.REALISTIC).project(
+            prior_decision=self._prior()
+        )
+        rendered = brief.render_compact()
+        assert "[LAST TURN]" in rendered
+        assert "mission types refused last turn: Anti-ship, OCA/Runway" in rendered
+
+    def test_refused_mission_types_reach_the_air_tasking_prompt(self) -> None:
+        campaign, game = fakes.synthetic_game()
+        brief = IntelProjector(game, IntelPolicy.REALISTIC).project(
+            prior_decision=self._prior()
+        )
+        ops = OperationsProjector(game, IntelPolicy.REALISTIC).project(
+            brief.campaign_id_hash, brief.campaign_revision
+        )
+        capabilities = capability_index_for(campaign.red)
+        prompt = build_stage_user_prompt(
+            CommanderStage.AIR_TASKING, brief, ops, capabilities
+        )
+        assert "mission types refused last turn: Anti-ship, OCA/Runway" in prompt
+
+    def test_no_line_when_nothing_was_refused(self) -> None:
+        _, game = fakes.synthetic_game()
+        brief = IntelProjector(game, IntelPolicy.REALISTIC).project(
+            prior_decision=PriorTurnSummary(turn=21, strategy="offensive")
+        )
+        assert "mission types refused last turn" not in brief.render_compact()
+
+    def test_refused_mission_types_leak_no_blue_information(self) -> None:
+        _, game = fakes.synthetic_game()
+        brief = IntelProjector(game, IntelPolicy.REALISTIC).project(
+            prior_decision=self._prior()
         )
         blob = fakes.serialise_everything(brief.to_dict(), brief.render_compact())
         assert fakes.blue_leaks_in(blob) == []
