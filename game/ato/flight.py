@@ -65,6 +65,7 @@ class Flight(
         channel: Optional[TacanChannel] = None,
         callsign_tcn: Optional[str] = None,
         claim_inv: bool = True,
+        ingress_band: Optional[str] = None,
     ) -> None:
         self.id = uuid.uuid4()
         self.package = package
@@ -131,6 +132,11 @@ class Flight(
         offset_factor = random.randint(0, offset_factor)
         self.plane_altitude_offset = 1000 * offset_factor * random.choice([-1, 1])
 
+        # Optional RED AI commander ingress altitude band ("low"/"medium"/"high").
+        # Biases the flight's cruise/combat altitude within doctrine limits; None
+        # leaves the default behaviour untouched.
+        self.ingress_band = ingress_band
+
     @property
     def available_callsigns(self) -> List[str]:
         callsigns = set()
@@ -170,6 +176,7 @@ class Flight(
         state["state"] = Uninitialized(self, state["squadron"].settings)
         if "use_same_loadout_for_all_members" not in state:
             state["use_same_loadout_for_all_members"] = True
+        state.setdefault("ingress_band", None)
         self.__dict__.update(state)
         if isinstance(self.roster, FlightRoster):
             self.roster = FlightMembers.from_roster(self, self.roster)

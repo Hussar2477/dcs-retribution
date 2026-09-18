@@ -36,6 +36,11 @@ class ProposedFlight:
 
     preferred_type: Optional[AircraftType] = field(default=None)
 
+    #: Optional ingress-altitude band ("low"|"medium"|"high") requested by the AI
+    #: commander. It only biases the flight's altitude within the faction's own
+    #: doctrine clamp and is ignored for helicopters. ``None`` keeps the default.
+    ingress_band: Optional[str] = field(default=None)
+
     def __str__(self) -> str:
         return f"{self.task} {self.num_aircraft} ship"
 

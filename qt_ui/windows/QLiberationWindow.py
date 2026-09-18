@@ -40,6 +40,7 @@ from qt_ui.widgets.QTopPanel import QTopPanel
 from qt_ui.widgets.ato import QAirTaskingOrderPanel
 from qt_ui.widgets.map.QLiberationMap import QLiberationMap
 from qt_ui.windows.GameUpdateSignal import GameUpdateSignal
+from qt_ui.windows.aicommander import QAiCommanderLogWindow
 from qt_ui.windows.QDebriefingWindow import QDebriefingWindow
 from qt_ui.windows.basemenu.QBaseMenu2 import QBaseMenu2
 from qt_ui.windows.groundobject.QGroundObjectMenu import QGroundObjectMenu
@@ -230,6 +231,16 @@ class QLiberationWindow(QMainWindow):
         self.openNotesAction.setIcon(CONST.ICONS["Notes"])
         self.openNotesAction.triggered.connect(self.showNotesDialog)
 
+        self.openAiCommanderLogAction = QAction("AI Log", self)
+        self.openAiCommanderLogAction.setIcon(
+            CONST.ICONS.get("Intel", CONST.ICONS["Notes"])
+        )
+        self.openAiCommanderLogAction.setToolTip(
+            "Show what the LLM AI opponent was told, what it decided and what "
+            "was refused."
+        )
+        self.openAiCommanderLogAction.triggered.connect(self.showAiCommanderLogDialog)
+
         self.importTemplatesAction = QAction("Import Layouts", self)
         self.importTemplatesAction.triggered.connect(self.import_templates)
 
@@ -239,6 +250,7 @@ class QLiberationWindow(QMainWindow):
         self.openSettingsAction.setVisible(enabled)
         self.openStatsAction.setVisible(enabled)
         self.openNotesAction.setVisible(enabled)
+        self.openAiCommanderLogAction.setVisible(enabled)
 
         # Also Disable SaveAction to prevent Keyboard Shortcut
         self.saveGameAction.setEnabled(enabled)
@@ -263,6 +275,7 @@ class QLiberationWindow(QMainWindow):
         self.actions_bar.addAction(self.openSettingsAction)
         self.actions_bar.addAction(self.openStatsAction)
         self.actions_bar.addAction(self.openNotesAction)
+        self.actions_bar.addAction(self.openAiCommanderLogAction)
 
     def initMenuBar(self):
         self.menu = self.menuBar()
@@ -625,6 +638,12 @@ class QLiberationWindow(QMainWindow):
 
     def showNotesDialog(self):
         self.dialog = QNotesWindow(self.game)
+        self.dialog.show()
+
+    def showAiCommanderLogDialog(self) -> None:
+        if self.game is None:
+            return
+        self.dialog = QAiCommanderLogWindow(self.game, self)
         self.dialog.show()
 
     def import_templates(self):
