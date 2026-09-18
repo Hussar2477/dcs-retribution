@@ -27,10 +27,12 @@ from typing import Any, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -132,10 +134,17 @@ class QAiCommanderLogWindow(QDialog):
         self.summary_view = _monospace("")
         self.tabs.addTab(self.summary_view, "Decision")
 
+        # The plain-English narrative belongs first: it is what a reader wants
+        # before drilling into the JSON-shaped tabs behind it.
+        self.reasoning_view = _monospace("")
+        self.tabs.insertTab(0, self.reasoning_view, "Reasoning")
+
         self.rejection_tree = QTreeWidget()
         self.rejection_tree.setColumnCount(3)
         self.rejection_tree.setHeaderLabels(["Element", "Reason", "Value"])
-        self.tabs.addTab(self.rejection_tree, "Rejected")
+        # Remember the tab's index rather than hard-coding it: inserting the
+        # Reasoning tab at 0 shifts everything after it along by one.
+        self.rejection_tab_index = self.tabs.addTab(self.rejection_tree, "Rejected")
 
         self.intel_view = _monospace("")
         self.tabs.addTab(self.intel_view, "Intel given to the AI")
@@ -160,6 +169,15 @@ class QAiCommanderLogWindow(QDialog):
 
         buttons = QHBoxLayout()
         buttons.addStretch()
+        export_button = QPushButton("Export this turn...")
+        export_button.setToolTip(
+            "Save everything about the selected turn -- the plain-English "
+            "narrative, the decision, the stages, the executed orders and the "
+            "full raw record -- to one text file you can share in a single "
+            "upload."
+        )
+        export_button.clicked.connect(self._export_current)
+        buttons.addWidget(export_button)
         reload_button = QPushButton("Reload")
         reload_button.clicked.connect(self.reload)
         buttons.addWidget(reload_button)
@@ -221,8 +239,17 @@ class QAiCommanderLogWindow(QDialog):
             mode = f" [active {accepted}/{len(stages)}]"
         return f"Turn {turn}{mode} - {state} (${float(cost):.4f})"
 
+    def _current_record(self) -> Optional[dict[str, Any]]:
+        """The record for the selected turn, or ``None`` if nothing is chosen."""
+
+        row = self.turn_list.currentRow()
+        if row < 0 or row >= len(self.records):
+            return None
+        return self.records[row]
+
     def _clear_views(self) -> None:
         for view in (
+            self.reasoning_view,
             self.summary_view,
             self.stage_view,
             self.execution_view,
@@ -242,6 +269,7 @@ class QAiCommanderLogWindow(QDialog):
             self._clear_views()
             return
         record = self.records[row]
+        self.reasoning_view.setPlainText(self._render_reasoning(record))
         self.summary_view.setPlainText(self._render_decision(record))
         self._render_rejections(record)
         self.stage_view.setPlainText(self._render_stages(record))
@@ -251,6 +279,180 @@ class QAiCommanderLogWindow(QDialog):
         self.prompt_view.setPlainText(self._render_prompt(record))
         self.cost_view.setPlainText(self._render_cost(record))
         self.raw_view.setPlainText(json.dumps(record, indent=2, sort_keys=True))
+
+    @staticmethod
+    def _stage_intent(stage: dict[str, Any]) -> str:
+        """The model's own one-line intent for a stage, if it recorded one."""
+
+        for key in ("accepted_plan", "parsed_plan"):
+            plan = stage.get(key)
+            if isinstance(plan, dict):
+                intent = plan.get("intent")
+                if intent:
+                    return str(intent)
+        return ""
+
+    @staticmethod
+    def _render_reasoning(record: dict[str, Any]) -> str:
+        """A short after-action narrative of what the commander thought and did.
+
+        This is deliberately plain English rather than the JSON-shaped tabs
+        behind it: it is meant to be read start to finish, and to be pasted or
+        exported so someone can understand a turn without opening the raw record.
+        """
+
+        turn = record.get("turn_id", "?")
+        accepted = bool(record.get("accepted"))
+        lines: list[str] = []
+
+        if accepted:
+            lines.append(f"Turn {turn}: the commander's plan was accepted and applied.")
+        else:
+            reason = record.get("fallback_reason") or "unknown"
+            lines.append(
+                f"Turn {turn}: the commander's plan was not used; Retribution "
+                f"fell back to its own automation (reason: {reason})."
+            )
+
+        directive = record.get("accepted_directive")
+        if isinstance(directive, dict):
+            lines.append("")
+            lines.append("What the commander wanted:")
+            intent = directive.get("commander_intent") or ""
+            if intent:
+                lines.append(f"  {intent}")
+            strategy = directive.get("strategy")
+            reserve = directive.get("reserve_policy")
+            if strategy:
+                sentence = f"  Its overall strategy was to {strategy}"
+                if reserve:
+                    sentence += f", holding reserves on a {reserve} footing"
+                lines.append(sentence + ".")
+            fronts = [str(f) for f in (directive.get("front_order") or [])]
+            postures = directive.get("front_postures") or {}
+            if fronts:
+                described = []
+                for front in fronts:
+                    posture = postures.get(front)
+                    described.append(f"{front} ({posture})" if posture else front)
+                lines.append(
+                    "  Fronts, in priority order: " + ", ".join(described) + "."
+                )
+            targets = [str(t) for t in (directive.get("target_set_order") or [])]
+            if targets:
+                lines.append(
+                    "  It wanted to strike, in order: " + ", ".join(targets) + "."
+                )
+            spending = [str(s) for s in (directive.get("procurement_order") or [])]
+            if spending:
+                lines.append(
+                    "  It wanted to spend, in order, on: " + ", ".join(spending) + "."
+                )
+
+        stages = _stages_of(record)
+        if stages:
+            lines.append("")
+            lines.append("Stage by stage:")
+            for stage in stages:
+                name = str(stage.get("stage") or "?")
+                if stage.get("accepted"):
+                    state = "was accepted"
+                elif not stage.get("ran"):
+                    state = "was skipped"
+                else:
+                    state = "produced no usable output"
+                refused = len(
+                    [r for r in stage.get("rejections") or [] if isinstance(r, dict)]
+                )
+                sentence = f"  The {name} stage {state}"
+                if refused:
+                    sentence += (
+                        f", and {refused} of its requests "
+                        f"{'was' if refused == 1 else 'were'} refused"
+                    )
+                fallback = stage.get("fallback_reason")
+                if fallback:
+                    sentence += f" ({fallback})"
+                lines.append(sentence + ".")
+                intent = QAiCommanderLogWindow._stage_intent(stage)
+                if intent:
+                    lines.append(f'    In its own words: "{intent}"')
+        else:
+            lines.append("")
+            lines.append(
+                "This turn was planned in commander mode: a single decision with "
+                "no separate logistics or air-tasking stages."
+            )
+
+        report = record.get("execution_report")
+        if isinstance(report, dict):
+            lines.append("")
+            lines.append("What actually happened:")
+            applied = report.get("applied")
+            failed = report.get("failed")
+            packages = report.get("packages_added")
+            lines.append(
+                f"  {applied} order(s) were applied and {failed} failed; "
+                f"{packages} package(s) were added to the air tasking order."
+            )
+            lines.append(
+                f"  Budget: {float(report.get('budget_before') or 0):.0f}M before, "
+                f"{float(report.get('budget_after') or 0):.0f}M after "
+                f"(spent {float(report.get('spent') or 0):.0f}M)."
+            )
+            orders = report.get("orders")
+            if isinstance(orders, list) and orders:
+                lines.append("")
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+                    description = order.get("description") or order.get("kind") or "?"
+                    if order.get("applied"):
+                        lines.append(f"  - {description} -- applied.")
+                    else:
+                        detail = order.get("detail") or "no detail given"
+                        lines.append(f"  - {description} -- failed: {detail}.")
+
+        # Summarise the refusals in one plain-English roll-up per stage.
+        refusal_lines = QAiCommanderLogWindow._reasoning_refusals(record)
+        if refusal_lines:
+            lines.append("")
+            lines.append("Why requests were refused:")
+            lines.extend(f"  {line}" for line in refusal_lines)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _reasoning_refusals(record: dict[str, Any]) -> list[str]:
+        """One sentence per stage summarising what it had refused, grouped by
+        reason, e.g. ``air_tasking: 3 refused -- 3x no squadron available``."""
+
+        stages = _stages_of(record)
+        if stages:
+            groups: list[tuple[str, list[dict[str, Any]]]] = [
+                (
+                    str(stage.get("stage") or "?"),
+                    [r for r in stage.get("rejections") or [] if isinstance(r, dict)],
+                )
+                for stage in stages
+            ]
+        else:
+            flat = [r for r in record.get("rejections") or [] if isinstance(r, dict)]
+            groups = [("decision", flat)] if flat else []
+
+        sentences: list[str] = []
+        for name, rejections in groups:
+            if not rejections:
+                continue
+            by_reason: dict[str, int] = {}
+            for rejection in rejections:
+                reason = str(rejection.get("reason") or "refused")
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+            detail = "; ".join(
+                f"{count}x {reason}" for reason, count in by_reason.items()
+            )
+            sentences.append(f"{name}: {len(rejections)} refused -- {detail}")
+        return sentences
 
     @staticmethod
     def _render_decision(record: dict[str, Any]) -> str:
@@ -364,7 +566,7 @@ class QAiCommanderLogWindow(QDialog):
                 self.rejection_tree.addTopLevelItem(self._rejection_item(rejection))
         for column in range(3):
             self.rejection_tree.resizeColumnToContents(column)
-        self.tabs.setTabText(1, f"Rejected ({len(rejections)})")
+        self.tabs.setTabText(self.rejection_tab_index, f"Rejected ({len(rejections)})")
 
     @staticmethod
     def _render_stages(record: dict[str, Any]) -> str:
@@ -571,3 +773,70 @@ class QAiCommanderLogWindow(QDialog):
                 f"latency={float(attempt.get('latency_seconds') or 0):.2f}s"
             )
         return "\n".join(lines)
+
+    # -- export -----------------------------------------------------------
+
+    def _export_current(self) -> None:
+        """Write the selected turn to one self-contained text file.
+
+        The point is that a user can share everything needed to improve the Red
+        AI as a single upload instead of a fistful of screenshots: the readable
+        narrative, the digested tabs, and the full raw record all in one file.
+        """
+
+        record = self._current_record()
+        if record is None:
+            QMessageBox.information(
+                self,
+                "Nothing to export",
+                "Select a turn on the left first, then export it.",
+            )
+            return
+
+        turn_id = record.get("turn_id", "unknown")
+        default_name = f"red-ai-turn-{turn_id}.txt"
+        default_dir = ""
+        if self.log is not None and self.campaign_id_hash:
+            try:
+                default_dir = str(self.log.campaign_directory(self.campaign_id_hash))
+            except Exception:
+                default_dir = ""
+        default_path = f"{default_dir}/{default_name}" if default_dir else default_name
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export this turn",
+            default_path,
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+
+        separator = "\n\n" + ("=" * 78) + "\n"
+        sections = [
+            "RED AI -- TURN EXPORT",
+            "REASONING (plain-English after-action narrative)\n\n"
+            + self._render_reasoning(record),
+            "DECISION\n\n" + self._render_decision(record),
+            "STAGES\n\n" + self._render_stages(record),
+            "ORDERS EXECUTED\n\n" + self._render_execution(record),
+            "RAW RECORD (verbatim JSON)\n\n"
+            + json.dumps(record, indent=2, sort_keys=True),
+        ]
+        blob = separator.join(sections) + "\n"
+
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(blob)
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "Export failed",
+                f"Could not write the file:\n{error}",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "Turn exported",
+            f"Wrote this turn to:\n{path}",
+        )
