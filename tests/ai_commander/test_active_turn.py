@@ -38,12 +38,22 @@ import pytest
 
 from game.ai_commander.audit import AuditLog
 from game.ai_commander.capabilities import CAPABILITY_CACHE, capability_index_for
-from game.ai_commander.controller import RedCommanderTurn, describe_turn_result
+from game.ai_commander.controller import (
+    _STAGE_INITIAL_OUTPUT_TOKENS,
+    RedCommanderTurn,
+    describe_turn_result,
+)
 from game.ai_commander.decision import example_decision_json
 from game.ai_commander.enums import CommanderMode, FallbackReason, IntelPolicy
 from game.ai_commander.intel import IntelProjector
 from game.ai_commander.operations import OperationsProjector
+from game.ai_commander.llmclient import (
+    MAX_OUTPUT_TOKENS_CEILING,
+    LlmResponse,
+    TokenUsage,
+)
 from game.ai_commander.plan import (
+    CommanderStage,
     example_air_tasking_json,
     example_logistics_json,
 )
@@ -417,3 +427,145 @@ class TestTurnWideCostLedger:
         )
         assert result.record is not None
         assert result.record.actual_cost <= 0.012
+
+
+# ---------------------------------------------------------------------------
+# Truncated logistics: salvage and the larger per-stage output budget
+# ---------------------------------------------------------------------------
+
+
+def _truncated_logistics_reply(turn: "_Turn") -> LlmResponse:
+    """A logistics reply cut off mid-array, as a real over-budget reply is.
+
+    The required envelope (schema, turn and revision) and two complete ground
+    orders are emitted; a third is cut off mid-value, exactly the failure a real
+    Decision Log showed (``finish_reason == "length"``, an unparseable body).
+    Built from the synthetic campaign's own identifiers so it validates once the
+    complete part is recovered.
+    """
+
+    ops = turn.operations
+    text = (
+        '{"schema_version": "red-commander-logistics/1", '
+        f'"turn_id": {ops.turn_id}, '
+        f'"campaign_revision": "{ops.campaign_revision}", '
+        '"intent": "reinforce the contested front", '
+        '"ground_orders": ['
+        '{"base_id": "BASE-1", "unit_id": "RED-ARTY", "quantity": 12}, '
+        '{"base_id": "BASE-1", "unit_id": "RED-TANK", "quantity": 8}, '
+        '{"base_id": "BASE-1", "unit_id": "RED-TR'
+    )
+    return LlmResponse(
+        text=text,
+        usage=TokenUsage(input_tokens=2000, output_tokens=30000, total_tokens=32000),
+        model="test/model",
+        finish_reason="length",
+        request_id="req-logi-trunc",
+        latency_seconds=0.01,
+    )
+
+
+def _logistics_stage(result: Any) -> Any:
+    assert result.record is not None
+    for stage in result.record.stages:
+        if stage.stage == CommanderStage.LOGISTICS.value:
+            return stage
+    raise AssertionError("no logistics stage was recorded")
+
+
+class TestTruncatedLogisticsIsSalvaged:
+    def test_a_truncated_but_salvageable_logistics_stage_is_accepted(
+        self, tmp_path: Any
+    ) -> None:
+        turn = _Turn()
+        result, client = turn.run(
+            [turn.stage1(), _truncated_logistics_reply(turn), turn.stage3()],
+            tmp_path,
+        )
+        # The cut-off reply is recovered on the initial attempt, so no repair
+        # round-trip is spent: three requests for three stages.
+        assert len(client.calls) == 3
+        summary = describe_turn_result(result)
+        assert summary["stages"]["logistics"] == "accepted"
+        assert result.fallback_reason is None
+
+    def test_the_salvage_is_noted_on_the_logistics_stage(self, tmp_path: Any) -> None:
+        turn = _Turn()
+        result, _ = turn.run(
+            [turn.stage1(), _truncated_logistics_reply(turn), turn.stage3()],
+            tmp_path,
+        )
+        stage = _logistics_stage(result)
+        assert any("recovered the complete part" in note for note in stage.notes)
+
+    def test_the_salvaged_logistics_orders_are_present(self, tmp_path: Any) -> None:
+        turn = _Turn()
+        result, _ = turn.run(
+            [turn.stage1(), _truncated_logistics_reply(turn), turn.stage3()],
+            tmp_path,
+        )
+        stage = _logistics_stage(result)
+        assert stage.accepted
+        # The two complete orders survived; the cut-off third was dropped.
+        orders = stage.accepted_plan["orders"] if stage.accepted_plan else []
+        joined = " ".join(orders)
+        assert "RED-ARTY" in joined
+        assert "RED-TANK" in joined
+        assert "RED-TR" not in joined
+
+
+class TestLogisticsAsksForMoreRoom:
+    def test_logistics_requests_a_larger_output_budget(self, tmp_path: Any) -> None:
+        turn = _Turn()
+        _, client = turn.run(
+            [turn.stage1(), turn.stage2_no_spend(), turn.stage3()],
+            tmp_path,
+            max_output_tokens=2000,
+        )
+        # One initial request per stage, in order: command, logistics, air.
+        command, logistics, air = client.max_output_tokens_calls
+        assert command == 2000, "the cheap command stage keeps the default budget"
+        assert air == 2000, "the air-tasking stage keeps the default budget"
+        assert logistics > command, "logistics must ask for more room"
+        expected = min(
+            max(2000, _STAGE_INITIAL_OUTPUT_TOKENS[CommanderStage.LOGISTICS]),
+            MAX_OUTPUT_TOKENS_CEILING,
+        )
+        assert logistics == expected
+
+    def test_a_logistics_repair_enlarges_from_the_larger_logistics_base(
+        self, tmp_path: Any
+    ) -> None:
+        # An empty, length-truncated reply that salvage cannot recover forces the
+        # one repair; it must be enlarged from the logistics base (not the small
+        # default), capped at the ceiling.
+        turn = _Turn()
+        empty_truncation = LlmResponse(
+            text="",
+            usage=TokenUsage(
+                input_tokens=2000, output_tokens=30000, total_tokens=32000
+            ),
+            model="test/model",
+            finish_reason="length",
+            request_id="req-logi-empty",
+            latency_seconds=0.01,
+        )
+        _, client = turn.run(
+            [
+                turn.stage1(),
+                empty_truncation,
+                turn.stage2_no_spend(),
+                turn.stage3(),
+            ],
+            tmp_path,
+            max_output_tokens=2000,
+        )
+        # command, logistics initial, logistics repair, air tasking.
+        command, logi_initial, logi_repair, _air = client.max_output_tokens_calls
+        base = min(
+            max(2000, _STAGE_INITIAL_OUTPUT_TOKENS[CommanderStage.LOGISTICS]),
+            MAX_OUTPUT_TOKENS_CEILING,
+        )
+        assert logi_initial == base
+        assert logi_repair == min(int(base * 1.5), MAX_OUTPUT_TOKENS_CEILING)
+        assert logi_repair > command

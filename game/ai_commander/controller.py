@@ -62,6 +62,7 @@ from game.ai_commander.intel import (
     PriorTurnSummary,
     RedCommanderBrief,
 )
+from game.ai_commander.jsonsalvage import salvage_truncated_json
 from game.ai_commander.legality import LegalityChecker
 from game.ai_commander.operations import (
     OperationsBrief,
@@ -117,6 +118,20 @@ FALLBACK_TO_PREVIOUS = "previous accepted directive, re-checked against live sta
 #: ``None``, which legitimately means "this provider supports neither mode".
 _UNSET: Any = object()
 
+#: Per-stage initial output budgets, overriding the configured default for the
+#: stages that need it. Only the logistics stage is listed: it emits by far the
+#: largest JSON payload (procurement, ground transfers, squadron relocations,
+#: runway repairs and squadron auto-tasking, each an independent list) and a
+#: real Decision Log showed its reply cut off at the budget, discarding RED's
+#: whole spending turn. A generous initial budget (bounded by
+#: ``MAX_OUTPUT_TOKENS_CEILING``, and never below the configured default) lets
+#: reasoning and the answer both fit; the cost ledger still reserves against it
+#: before every call, so the per-turn cap is never at its mercy. COMMAND and
+#: AIR_TASKING keep the smaller default and stay inexpensive.
+_STAGE_INITIAL_OUTPUT_TOKENS: dict[CommanderStage, int] = {
+    CommanderStage.LOGISTICS: 30000,
+}
+
 #: What the built-in automation covers when an ACTIVE stage degrades. Recorded as
 #: a stage note so the log says which parts of the turn RED planned itself.
 _STAGE_FALLBACK_TEXT = {
@@ -147,6 +162,9 @@ class _StageOutcome:
 
     value: Optional[Any] = None
     rejections: list[Rejection] = field(default_factory=list)
+    #: True when the value was recovered from a cut-off reply by salvaging the
+    #: complete part of a truncated JSON object rather than parsing it whole.
+    salvaged: bool = False
 
     @property
     def ok(self) -> bool:
@@ -298,23 +316,53 @@ class RedCommanderTurn:
         "your reasoning."
     )
 
-    def _repair_budget(self, response: LlmResponse) -> tuple[int, bool]:
+    def _repair_budget(
+        self, response: LlmResponse, base: Optional[int] = None
+    ) -> tuple[int, bool]:
         """Decide the output budget for the single repair after a failure.
 
-        Returns ``(budget, truncated)``. When the failed response looks
-        truncated (cut off before the JSON could be emitted, typically because
-        the reasoning channel ate the whole budget) the one repair is given an
-        enlarged budget so it has room to finish -- capped at
+        Returns ``(budget, truncated)``. ``base`` is the budget the failed
+        request was made with -- the per-stage budget for an ACTIVE stage, or
+        the configured default for COMMANDER mode -- and the enlarged repair
+        grows from it so a stage that already asks for a large budget still
+        gets the extra room. When the failed response looks truncated (cut off
+        before the JSON could be emitted, typically because the reasoning
+        channel ate the whole budget) the one repair is given an enlarged
+        budget so it has room to finish -- capped at
         ``MAX_OUTPUT_TOKENS_CEILING`` and still reserved against the cost
         ledger, so the per-turn cap remains the final authority. A genuine
         schema error keeps the ordinary budget: more room would not help and
         would only cost more.
         """
 
-        base = int(self.config.max_output_tokens)
+        if base is None:
+            base = int(self.config.max_output_tokens)
+        base = int(base)
         if response.looks_truncated(base):
             return min(int(base * 1.5), MAX_OUTPUT_TOKENS_CEILING), True
         return base, False
+
+    def _stage_output_budget(self, stage: CommanderStage) -> int:
+        """The initial output budget for one ACTIVE stage's request.
+
+        The logistics stage emits by far the largest JSON payload -- procurement,
+        ground transfers, squadron relocations, runway repairs and squadron
+        auto-tasking, each an independent list -- and a reasoning model spends a
+        further slice on hidden chain-of-thought before the answer, so it is
+        given a larger initial budget than the cheap COMMAND stage. This is a
+        code-level per-stage override (never larger than
+        ``MAX_OUTPUT_TOKENS_CEILING``) rather than a raise of the shared default,
+        which keeps the small COMMAND and AIR_TASKING requests inexpensive. The
+        cost ledger still reserves against this value before every call, so a
+        larger budget can never breach the per-turn cap; it only avoids a
+        needless truncation.
+        """
+
+        base = int(self.config.max_output_tokens)
+        override = _STAGE_INITIAL_OUTPUT_TOKENS.get(stage)
+        if override is None:
+            return base
+        return min(max(base, override), MAX_OUTPUT_TOKENS_CEILING)
 
     def _run_commander(
         self, client: ChatCompletionClient, price: ModelPrice
@@ -538,6 +586,7 @@ class RedCommanderTurn:
             price.supports_json_schema,
             price.supports_response_format or not self.catalog_available,
         )
+        stage_budget = self._stage_output_budget(stage)
         outcome, response = self._attempt(
             client,
             messages,
@@ -546,12 +595,13 @@ class RedCommanderTurn:
             parser=parser,
             response_format=response_format,
             stage=entry,
+            max_output_tokens=stage_budget,
         )
         if outcome is None:
             return entry, None
 
         if not outcome.ok and response is not None:
-            repair_budget, truncated = self._repair_budget(response)
+            repair_budget, truncated = self._repair_budget(response, stage_budget)
             error_summary = (
                 self._TRUNCATION_REPAIR_SUMMARY
                 if truncated
@@ -590,6 +640,11 @@ class RedCommanderTurn:
         self.record.rejections.extend(outcome.rejection_dicts)
         if not outcome.ok:
             return entry, None
+        if outcome.salvaged:
+            entry.notes.append(
+                "the reply was cut off; recovered the complete part of the plan "
+                "and used it"
+            )
         return entry, outcome
 
     def _active_command_stage(
@@ -1143,9 +1198,24 @@ class RedCommanderTurn:
         try:
             payload = extract_json_object(text)
         except DecisionValidationError as error:
-            return _StageOutcome(
-                value=None, rejections=[Rejection("<response>", str(error))]
-            )
+            # The reply would not parse. A large list-based plan (the logistics
+            # stage especially) can overrun the output budget and stop partway
+            # through an array element. Rather than discard the whole stage --
+            # every order the model *did* emit with it -- recover the complete
+            # prefix of the truncated object and validate that. Salvage is pure
+            # and never raises, and only ever yields a well-formed object; the
+            # ordinary validation below still drops any partial trailing element.
+            salvaged = salvage_truncated_json(text)
+            if salvaged is None:
+                return _StageOutcome(
+                    value=None, rejections=[Rejection("<response>", str(error))]
+                )
+            plan, rejections = validator(salvaged)
+            if plan is None:
+                return _StageOutcome(
+                    value=None, rejections=[Rejection("<response>", str(error))]
+                )
+            return _StageOutcome(value=plan, rejections=rejections, salvaged=True)
         plan, rejections = validator(payload)
         return _StageOutcome(value=plan, rejections=rejections)
 
