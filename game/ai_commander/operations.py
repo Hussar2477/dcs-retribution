@@ -234,6 +234,12 @@ class SquadronView:
     relocating_to_base_id: Optional[str]
     capable_tasks: tuple[str, ...]
     auto_assignable_tasks: tuple[str, ...]
+    #: How many replacement airframes this squadron can actually buy at its home
+    #: base right now: the real Retribution purchase bound, i.e. the smaller of the
+    #: home base's free parking and (when squadron aircraft limits are on) the
+    #: squadron's own remaining capacity. ``0`` means the base is full and no buy
+    #: for this squadron will fit. RED's own data, so surfacing it is not cheating.
+    can_add: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return jsonable(self)
@@ -254,6 +260,7 @@ class SquadronView:
             f"| onhand={self.aircraft_on_hand} untasked={self.aircraft_untasked}"
             f"{on_order} | pilots={self.pilots_available} "
             f"| plannable_now={self.max_fulfillable_aircraft} "
+            f"| can_add={self.can_add} "
             f"| ${self.price_per_aircraft}/airframe | can_fly={tasks} | auto={auto}"
             f"{relocation}"
         )
@@ -816,10 +823,44 @@ class OperationsProjector:
                     ),
                     capable_tasks=capable,
                     auto_assignable_tasks=auto,
+                    can_add=self._squadron_can_add(squadron),
                 )
             )
             self.resolver.squadrons[squadron_ids[key]] = squadron
         return tuple(views), max(0, len(squadrons) - len(views))
+
+    def _squadron_can_add(self, squadron: Any) -> int:
+        """How many replacement airframes this squadron can actually buy at its home
+        base right now, mirroring Retribution's own purchase test in
+        :meth:`AircraftPurchaseAdapter.can_buy`: a buy needs a free parking slot at
+        the home base (:meth:`ControlPoint.unclaimed_parking` for the squadron's own
+        parking type) and, when squadron aircraft limits are enabled, headroom under
+        the squadron's max size (:meth:`Squadron.has_aircraft_capacity_for`). Returns
+        ``min`` of the two, clamped to ``>= 0``. RED-only data a human already sees.
+        """
+        from game.theater import ParkingType
+
+        try:
+            location = getattr(squadron, "location", None)
+            if location is None:
+                return 0
+            parking_type = ParkingType().from_squadron(squadron)
+            headroom = int(location.unclaimed_parking(parking_type))
+        except Exception:  # pragma: no cover - defensive
+            logging.debug("Squadron parking headroom failed", exc_info=True)
+            return 0
+        try:
+            settings = getattr(squadron, "settings", None) or self.game.settings
+            if bool(getattr(settings, "enable_squadron_aircraft_limits", False)):
+                capacity = (
+                    int(getattr(squadron, "max_size", 0))
+                    - self._int_or_zero(getattr(squadron, "owned_aircraft", 0))
+                    - self._int_or_zero(getattr(squadron, "pending_deliveries", 0))
+                )
+                headroom = min(headroom, capacity)
+        except Exception:  # pragma: no cover - defensive
+            logging.debug("Squadron capacity headroom failed", exc_info=True)
+        return max(0, headroom)
 
     @staticmethod
     def _squadron_capable(squadron: Any, task: FlightType) -> bool:

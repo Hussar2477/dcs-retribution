@@ -176,6 +176,23 @@ class TestLogisticsBriefing:
         assert "squadron_relocations" in text
         assert "Mi-28N" in text
 
+    def test_can_add_replacement_headroom_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Aircraft buys need parking; each squadron shows can_add=N as the cap,
+        # and budget that cannot buy aircraft is redirected, never left idle.
+        assert "can_add=N" in text
+        assert "parking" in text
+        assert "can_add=0" in text
+        assert "redirect" in text
+
+    def test_front_line_buys_are_paired_with_forward_transfers(self) -> None:
+        text = self._text()
+        # A front-line ground buy must be paired with a forward ground_transfers
+        # entry, because ground can only be recruited at a rear supply base.
+        assert "PAIRED" in text
+        assert "ground_transfers" in text
+        assert "recruit_ground=yes" in text
+
 
 class TestCommandBriefing:
     def _text(self) -> str:

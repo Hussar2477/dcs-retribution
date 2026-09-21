@@ -27,6 +27,7 @@ from game.ai_commander.operations import (
     BaseView,
     OperationsBrief,
     OperationsProjector,
+    SquadronView,
     TargetView,
 )
 from tests.ai_commander import fakes
@@ -227,6 +228,64 @@ class TestBriefIsAccurate:
         _, first = _brief()
         _, second = _brief()
         assert first.content_hash() == second.content_hash()
+
+
+class TestSquadronReplacementHeadroom:
+    """``can_add=N`` tells the model how many airframes a squadron can really buy at
+    its home base right now: ``min(free parking, squadron capacity headroom)``,
+    clamped to ``>= 0``. It is RED's own data, so surfacing it is not cheating.
+    """
+
+    def test_can_add_is_rendered_and_reflects_parking(self) -> None:
+        _, brief = _brief()
+        sqn1 = brief.squadron("SQN-1")
+        sqn2 = brief.squadron("SQN-2")
+        assert sqn1 is not None and sqn2 is not None
+        # SQN-1 sits at the front base (6 free parking) with ample capacity left
+        # (max_size 24, 8 on hand + 1 on order), so parking is the binding limit.
+        assert sqn1.can_add == 6
+        assert "can_add=6" in sqn1.render()
+        # SQN-2 sits at the rear base (20 free parking) with 20 of capacity left.
+        assert sqn2.can_add == 20
+        assert "can_add=20" in sqn2.render()
+
+    def test_squadron_capacity_is_the_binding_limit_when_smaller(self) -> None:
+        campaign, game = fakes.synthetic_game()
+        projector = OperationsProjector(game, IntelPolicy.REALISTIC)
+        squadron = campaign.red_squadron_1
+        # Plenty of parking, but the squadron is nearly at its own max size:
+        # 10 - 8 owned - 1 on order = 1 slot of capacity left.
+        squadron.location.unclaimed_parking.return_value = 12
+        squadron.max_size = 10
+        assert projector._squadron_can_add(squadron) == 1
+
+    def test_can_add_is_zero_when_the_home_base_is_full(self) -> None:
+        campaign, game = fakes.synthetic_game()
+        projector = OperationsProjector(game, IntelPolicy.REALISTIC)
+        squadron = campaign.red_squadron_2
+        squadron.location.unclaimed_parking.return_value = 0
+        assert projector._squadron_can_add(squadron) == 0
+
+    def test_a_full_base_renders_can_add_zero(self) -> None:
+        view = SquadronView(
+            id="SQN-1",
+            name="1st Fighter",
+            aircraft_id="MiG-29",
+            base_id="BASE-1",
+            base_name="Anapa",
+            aircraft_on_hand=8,
+            aircraft_untasked=2,
+            aircraft_on_order=0,
+            pilots_available=4,
+            pilot_limit_enabled=False,
+            max_fulfillable_aircraft=2,
+            price_per_aircraft=10,
+            relocating_to_base_id=None,
+            capable_tasks=("CAP",),
+            auto_assignable_tasks=("CAP",),
+            can_add=0,
+        )
+        assert "can_add=0" in view.render()
 
 
 class TestGroundInventoryIsListedInFull:

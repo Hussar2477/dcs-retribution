@@ -268,6 +268,45 @@ class TestAirTaskingCheatAttempts:
         assert plan is not None
         assert not plan.packages
 
+    def test_a_wrong_airframe_hint_is_dropped_not_rejected(self) -> None:
+        """The mission is legal for the target but the named airframe cannot fly it.
+
+        TGT-1 is an air-defence site (legal DEAD/SEAD/SEAD Sweep); RED-JET flies
+        SEAD but not DEAD. Rejecting the flight here is what strands packages --
+        the wrong-airframe flight is often the package's striker/lead -- so the
+        OPTIONAL airframe hint is silently dropped (aircraft_id -> None) and the
+        flight kept, letting Retribution's own planner assign a capable airframe.
+        No rejection is recorded, mirroring the other silent repairs in this file.
+        """
+
+        brief, caps = _context()
+        payload = self._package_payload(
+            brief,
+            {
+                "target_id": "TGT-1",
+                "priority": 1,
+                "flights": [
+                    {
+                        "mission_type": "DEAD",
+                        "aircraft_count": 2,
+                        "aircraft_id": "RED-JET",
+                    }
+                ],
+            },
+        )
+        plan, rejections = validate_air_tasking_plan(payload, brief, caps)
+        assert "this airframe cannot fly the requested mission type" not in _reasons(
+            rejections
+        )
+        assert plan is not None
+        assert len(plan.packages) == 1
+        flights = plan.packages[0].flights
+        assert len(flights) == 1
+        # The already-legal mission is kept as requested (no remap needed).
+        assert flights[0].mission_type.value == "DEAD"
+        # The wrong hint is gone; the planner will pick a capable airframe.
+        assert flights[0].aircraft_id is None
+
     def test_an_illegal_striker_mission_is_repaired_not_rejected(self) -> None:
         """A striker pointed at the wrong mission is remapped, not thrown away.
 

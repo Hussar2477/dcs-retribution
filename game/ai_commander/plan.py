@@ -1294,15 +1294,16 @@ def _validate_flights(
                 continue
             capability = capabilities.aircraft_for(aircraft_id)
             if capability is not None and mission.value not in capability.role_names():
-                rejections.append(
-                    Rejection(
-                        element=f"{flight_element}.aircraft_id",
-                        reason="this airframe cannot fly the requested mission type",
-                        value=aircraft_id,
-                    )
-                )
-                continue
-            if capability is not None and count > capability.max_flight_size:
+                # The requested mission is already legal for the target (an illegal
+                # mission_type is remapped above); only the model's OPTIONAL airframe
+                # hint names a type that cannot fly it. Dropping the whole flight here
+                # is what strands packages -- the wrong-airframe flight is often the
+                # striker/lead, leaving an escort-only package that then fails. So we
+                # silently discard the hint (set aircraft_id=None) and keep the flight,
+                # letting Retribution's own mission planner assign a capable airframe.
+                # No Rejection is recorded, mirroring the other silent repairs here.
+                aircraft_id = None
+            elif capability is not None and count > capability.max_flight_size:
                 rejections.append(
                     Rejection(
                         element=f"{flight_element}.aircraft_count",
