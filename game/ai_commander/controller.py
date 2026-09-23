@@ -529,6 +529,13 @@ class RedCommanderTurn:
         if tasking is not None:
             executor.execute_air_tasking(tasking)
 
+        # Deterministic backstop: commit RED's attack helicopters to the front
+        # regardless of what the air-tasking stage produced. This runs even when
+        # that stage timed out (``tasking is None``) and, when it succeeded, adds
+        # to the LLM's packages using only aircraft still untasked -- so it never
+        # double-tasks squadrons the model already committed.
+        executor.auto_commit_attack_helicopters()
+
         self.record.execution_report = executor.report.to_dict()
         return self._accept(directive, execution=executor.report)
 

@@ -37,6 +37,7 @@ from game.ai_commander.planlegality import (
     ExecutableLogistics,
 )
 from game.ato.flighttype import FlightType
+from game.utils import meters
 
 if TYPE_CHECKING:
     from game.coalition import Coalition
@@ -51,6 +52,20 @@ _ESCORT_TYPES: dict[FlightType, str] = {
     FlightType.SEAD_ESCORT: "Sead",
     FlightType.REFUELING: "Refuel",
 }
+
+#: A RED base is treated as "forward" for attack helicopters when it lies within
+#: this many nautical miles of an active front. Rear attack-heli squadrons are
+#: relocated to the nearest forward base that has room; squadrons already this
+#: close are left where they are.
+_HELI_FORWARD_NM: float = 50.0
+
+#: Mission types an attack helicopter is committed to at the front, in preference
+#: order. CAS supports the ground battle directly; BAI is the fallback.
+_HELI_FRONT_TASKS: tuple[FlightType, ...] = (FlightType.CAS, FlightType.BAI)
+
+#: Cap on the number of helicopters force-committed per squadron per turn, so a
+#: single squadron does not empty itself into one oversized package.
+_HELI_FLIGHT_SIZE: int = 2
 
 
 @dataclass
@@ -151,6 +166,7 @@ class PlanExecutor:
         self._buy_aircraft(plan)
         self._buy_ground_units(plan)
         self._repair_runways(plan)
+        self._replace_ground_groups(plan)
         self._relocate_squadrons(plan)
         self._retask_squadrons(plan)
         self._transfer_ground_units(plan)
@@ -203,6 +219,39 @@ class PlanExecutor:
                 self.report.record("runway_repair", order.describe(), False, str(exc))
                 continue
             self.report.record("runway_repair", order.describe(), True)
+
+    def _replace_ground_groups(self, plan: ExecutableLogistics) -> None:
+        """Rebuild RED static sites through the human buy path, RED money only."""
+
+        for order in plan.ground_group_replacements:
+            try:
+                ground_object = order.ground_object
+                # Head the rebuilt site toward the front, exactly as the buy menu.
+                ground_object.heading = (
+                    self.game.theater.heading_to_conflict_from(ground_object.position)
+                    or ground_object.heading
+                )
+                # Clear whatever wreck remains and rebuild from the priced recipe.
+                ground_object.groups = []
+                for group_name, unit_group, dcs_type, count in order.group_plan:
+                    order.force_group.create_theater_group_for_tgo(
+                        ground_object,
+                        unit_group,
+                        f"{ground_object.name} ({group_name})",
+                        self.game,
+                        dcs_type,
+                        count,
+                    )
+                self.coalition.adjust_budget(-float(order.cost))
+            except Exception as exc:
+                logging.warning(
+                    "RED commander site rebuild failed: %s", order.describe()
+                )
+                self.report.record(
+                    "ground_group_replacement", order.describe(), False, str(exc)
+                )
+                continue
+            self.report.record("ground_group_replacement", order.describe(), True)
 
     def _relocate_squadrons(self, plan: ExecutableLogistics) -> None:
         for order in plan.relocations:
@@ -344,3 +393,254 @@ class PlanExecutor:
         except Exception:  # pragma: no cover - defensive
             logging.debug("Airframe resolution failed", exc_info=True)
         return None
+
+    # -- deterministic attack-helicopter commitment -----------------------
+
+    def auto_commit_attack_helicopters(self) -> None:
+        """Make RED actually use its attack helicopters, without the LLM.
+
+        The air-tasking stage frequently leaves rotary-wing squadrons idle --
+        their CAS suitability scores below fixed-wing airframes, so the planner
+        prefers jets and the helicopters sit at their bases. Worse, when the
+        stage times out no packages are planned at all. This runs regardless of
+        that stage and, for RED only:
+
+        * enables CAS/BAI on every capable attack-helicopter squadron;
+        * forward-relocates rear squadrons to a RED base near the front that has
+          room for them;
+        * force-commits idle, in-range squadrons into CAS/BAI packages through
+          the same :class:`PackageFulfiller` path the air-tasking stage uses.
+
+        It is idempotent against the air-tasking stage: force-commitment draws
+        only on aircraft still untasked after that stage ran, so squadrons the
+        LLM already committed are left alone.
+        """
+
+        try:
+            if not self.coalition.player.is_red:
+                return
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        fronts = self._active_fronts()
+        if not fronts:
+            return
+        squadrons = self._attack_heli_squadrons()
+        if not squadrons:
+            return
+
+        for squadron in squadrons:
+            self._enable_heli_cas_bai(squadron)
+        for squadron in squadrons:
+            self._relocate_heli_forward(squadron, fronts)
+        self._commit_idle_helis(squadrons, fronts)
+
+    def _active_fronts(self) -> list[Any]:
+        """RED's own active front lines. Front geometry between RED's own bases
+        and the enemy is not hidden information, so this reads only RED-owned
+        control points and never indexes enemy strength."""
+
+        fronts: list[Any] = []
+        seen: set[int] = set()
+        try:
+            for control_point in self.game.theater.control_points_for(
+                self.coalition.player
+            ):
+                for front in getattr(control_point, "front_lines", {}).values():
+                    if id(front) not in seen:
+                        seen.add(id(front))
+                        fronts.append(front)
+        except Exception:  # pragma: no cover - defensive
+            logging.debug("RED front enumeration failed", exc_info=True)
+        return fronts
+
+    def _attack_heli_squadrons(self) -> list[Any]:
+        squadrons: list[Any] = []
+        try:
+            for squadron in self.coalition.air_wing.iter_squadrons():
+                aircraft = getattr(squadron, "aircraft", None)
+                if aircraft is None or not getattr(aircraft, "helicopter", False):
+                    continue
+                if any(squadron.capable_of(task) for task in _HELI_FRONT_TASKS):
+                    squadrons.append(squadron)
+        except Exception:  # pragma: no cover - defensive
+            logging.debug("Attack-heli enumeration failed", exc_info=True)
+        return squadrons
+
+    def _enable_heli_cas_bai(self, squadron: Any) -> None:
+        try:
+            desired = set(squadron.auto_assignable_mission_types)
+            missing = {
+                task
+                for task in _HELI_FRONT_TASKS
+                if squadron.capable_of(task) and task not in desired
+            }
+            if not missing:
+                return
+            squadron.set_auto_assignable_mission_types(desired | missing)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.report.record("heli_tasking", str(squadron), False, str(exc))
+            return
+        self.report.record(
+            "heli_tasking",
+            f"enable CAS/BAI on {squadron}",
+            True,
+            "attack helicopters made auto-assignable at the front",
+        )
+
+    def _nm_to_nearest_front(self, position: Any, fronts: list[Any]) -> Optional[float]:
+        best: Optional[float] = None
+        for front in fronts:
+            front_position = getattr(front, "position", None)
+            if front_position is None:
+                continue
+            try:
+                nm = meters(position.distance_to_point(front_position)).nautical_miles
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if best is None or nm < best:
+                best = nm
+        return best
+
+    def _relocate_heli_forward(self, squadron: Any, fronts: list[Any]) -> None:
+        if getattr(squadron, "destination", None) is not None:
+            return
+        if getattr(squadron, "owned_aircraft", 0) <= 0:
+            return
+        location = getattr(squadron, "location", None)
+        if location is None:
+            return
+        current_nm = self._nm_to_nearest_front(location.position, fronts)
+        if current_nm is None or current_nm <= _HELI_FORWARD_NM:
+            return  # already at the front, or no usable front position
+
+        from game.theater import ParkingType
+
+        try:
+            parking_type = ParkingType().from_squadron(squadron)
+            need = squadron.expected_size_next_turn
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        best_cp: Any = None
+        best_nm = current_nm
+        try:
+            candidates = self.game.theater.control_points_for(self.coalition.player)
+        except Exception:  # pragma: no cover - defensive
+            return
+        for control_point in candidates:
+            if control_point is location:
+                continue
+            cp_nm = self._nm_to_nearest_front(control_point.position, fronts)
+            if cp_nm is None or cp_nm > _HELI_FORWARD_NM or cp_nm >= best_nm:
+                continue
+            try:
+                if control_point.unclaimed_parking(parking_type) < need:
+                    continue
+                if not control_point.can_operate(squadron.aircraft):
+                    continue
+            except Exception:  # pragma: no cover - defensive
+                continue
+            best_cp = control_point
+            best_nm = cp_nm
+
+        if best_cp is None:
+            return
+        try:
+            squadron.plan_relocation(best_cp, self.now)
+        except Exception as exc:
+            self.report.record(
+                "heli_relocation", f"{squadron} -> {best_cp}", False, str(exc)
+            )
+            return
+        self.report.record(
+            "heli_relocation",
+            f"relocate {squadron} to {best_cp}",
+            True,
+            f"moved attack helicopters within {best_nm:.0f}nm of the front",
+        )
+
+    def _commit_idle_helis(self, squadrons: list[Any], fronts: list[Any]) -> None:
+        from game.commander.packagefulfiller import PackageFulfiller
+        from game.profiling import MultiEventTracer
+
+        fulfiller = PackageFulfiller(
+            self.coalition,
+            self.game.theater,
+            self.game.db.flights,
+            self.game.settings,
+        )
+        with MultiEventTracer() as tracer:
+            with tracer.trace("RED attack-helicopter auto-commit"):
+                for squadron in squadrons:
+                    self._commit_one_heli_squadron(fulfiller, squadron, fronts, tracer)
+
+    def _commit_one_heli_squadron(
+        self, fulfiller: Any, squadron: Any, fronts: list[Any], tracer: Any
+    ) -> None:
+        from game.commander.missionproposals import ProposedFlight, ProposedMission
+
+        if getattr(squadron, "destination", None) is not None:
+            return  # relocating; not available at the front this turn
+        untasked = getattr(squadron, "untasked_aircraft", 0)
+        if untasked <= 0:
+            return  # already committed elsewhere -- keeps this idempotent
+
+        size = min(untasked, _HELI_FLIGHT_SIZE)
+        task: Optional[FlightType] = None
+        target: Any = None
+        for candidate in _HELI_FRONT_TASKS:
+            if not squadron.capable_of(candidate):
+                continue
+            for front in sorted(
+                fronts,
+                key=lambda f: self._nm_to_nearest_front(squadron.location.position, [f])
+                or float("inf"),
+            ):
+                try:
+                    if squadron.can_auto_assign_mission(
+                        front, candidate, size, True, True
+                    ):
+                        task = candidate
+                        target = front
+                        break
+                except Exception:  # pragma: no cover - defensive
+                    continue
+            if task is not None:
+                break
+        if task is None or target is None:
+            return
+
+        flight = ProposedFlight(
+            task=task,
+            num_aircraft=size,
+            escort_type=None,
+            preferred_type=squadron.aircraft,
+            ingress_band=None,
+        )
+        describe = f"{task.value} from {squadron} against the front"
+        try:
+            package = fulfiller.plan_mission(
+                ProposedMission(location=target, flights=[flight], asap=True),
+                1,
+                self.now,
+                tracer,
+            )
+        except Exception as exc:
+            self.report.record("heli_package", describe, False, str(exc))
+            return
+        if package is None:
+            self.report.record(
+                "heli_package",
+                describe,
+                False,
+                "the mission planner could not crew or route this package",
+            )
+            return
+        try:
+            self.coalition.ato.add_package(package)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.report.record("heli_package", describe, False, str(exc))
+            return
+        self.report.packages_added += 1
+        self.report.record("heli_package", describe, True)

@@ -174,6 +174,14 @@ _STAGE_BRIEFING: dict[CommanderStage, str] = {
         "already own but cannot buy (for example SA-15 Tor, SA-18 Igla, ZU-23) "
         "forward from the rear to the front base, so short-ranged air defence "
         "sits where the enemy strikes and keeps your ground units alive.\n"
+        "REBUILD DESTROYED SITES -- your bases show rebuildable_sites when a SAM "
+        "site, early-warning radar or ground group of yours has been degraded or "
+        "destroyed. Rebuild the ones that matter with a ground_group_replacements "
+        'entry giving that base_id and the category ("air_defence" for a SAM, '
+        '"ewr" for a radar, "ground" for a vehicle group); the cheapest '
+        "affordable template your faction owns is chosen and rebuilt for you, and "
+        "the cost comes out of this turn's budget. Prioritise the air defence and "
+        "radar cover protecting your income and front-line bases.\n"
         "FORWARD-BASE ATTACK HELICOPTERS -- attack helicopters (for example "
         "Mi-28N Havoc, Mi-24) are short-radius and useless parked in the rear, "
         "where they never reach the fight. Use squadron_relocations to move their "

@@ -269,6 +269,29 @@ class GroundTransferOrder:
 
 
 @dataclass(frozen=True)
+class GroundGroupOrder:
+    """Rebuild a destroyed/degraded static site at one of RED's own bases.
+
+    ``category`` selects which kind of site to rebuild ("air_defence" for a SAM
+    site, "ewr" for an early-warning radar, "ground" for a vehicle group). The
+    executor picks the neediest matching site at ``base_id`` and rebuilds it from
+    an affordable armed-forces template, exactly as a human does through the buy
+    menu.
+    """
+
+    base_id: str
+    category: str
+
+    def describe(self) -> str:
+        return f"rebuild {self.category} site at {self.base_id}"
+
+
+#: The site categories RED may rebuild, and the human buy-menu role/task each maps
+#: to. Kept here so the schema, validator and doctrine share one source of truth.
+GROUND_GROUP_CATEGORIES: tuple[str, ...] = ("air_defence", "ewr", "ground")
+
+
+@dataclass(frozen=True)
 class LogisticsPlan:
     """A structurally valid logistics stage output."""
 
@@ -282,6 +305,7 @@ class LogisticsPlan:
     squadron_relocations: tuple[SquadronRelocationOrder, ...] = field(default=())
     squadron_tasking: tuple[SquadronTaskingOrder, ...] = field(default=())
     ground_transfers: tuple[GroundTransferOrder, ...] = field(default=())
+    ground_group_replacements: tuple[GroundGroupOrder, ...] = field(default=())
 
     @property
     def has_content(self) -> bool:
@@ -292,6 +316,7 @@ class LogisticsPlan:
             or self.squadron_relocations
             or self.squadron_tasking
             or self.ground_transfers
+            or self.ground_group_replacements
         )
 
     @property
@@ -303,6 +328,7 @@ class LogisticsPlan:
             + len(self.squadron_relocations)
             + len(self.squadron_tasking)
             + len(self.ground_transfers)
+            + len(self.ground_group_replacements)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -345,6 +371,10 @@ class LogisticsPlan:
                 }
                 for o in self.ground_transfers
             ],
+            "ground_group_replacements": [
+                {"base_id": o.base_id, "category": o.category}
+                for o in self.ground_group_replacements
+            ],
         }
 
     def render_summary(self) -> str:
@@ -356,6 +386,7 @@ class LogisticsPlan:
             self.squadron_relocations,
             self.squadron_tasking,
             self.ground_transfers,
+            self.ground_group_replacements,
         ):
             lines.extend(f"  {order.describe()}" for order in group)
         if self.order_count == 0:
@@ -623,6 +654,7 @@ _LOGISTICS_KEYS = (
     "squadron_relocations",
     "squadron_tasking",
     "ground_transfers",
+    "ground_group_replacements",
 )
 
 
@@ -651,6 +683,7 @@ def validate_logistics_plan(
     relocations = _validate_relocations(payload, brief, rejections)
     tasking = _validate_squadron_tasking(payload, brief, rejections)
     transfers = _validate_ground_transfers(payload, brief, capabilities, rejections)
+    replacements = _validate_ground_group_replacements(payload, brief, rejections)
 
     plan = LogisticsPlan(
         schema_version=LOGISTICS_SCHEMA_VERSION,
@@ -663,6 +696,7 @@ def validate_logistics_plan(
         squadron_relocations=relocations,
         squadron_tasking=tasking,
         ground_transfers=transfers,
+        ground_group_replacements=replacements,
     )
     return plan, rejections
 
@@ -798,6 +832,57 @@ def _validate_runway_repairs(
             continue
         seen.add(base_id)
         orders.append(RunwayRepairOrder(base_id=base_id))
+    return tuple(orders)
+
+
+def _validate_ground_group_replacements(
+    payload: dict[str, Any], brief: OperationsBrief, rejections: list[Rejection]
+) -> tuple[GroundGroupOrder, ...]:
+    orders: list[GroundGroupOrder] = []
+    seen: set[tuple[str, str]] = set()
+    for index, entry in enumerate(
+        _entries(payload, "ground_group_replacements", rejections)
+    ):
+        element = f"ground_group_replacements[{index}]"
+        if not isinstance(entry, dict):
+            rejections.append(
+                Rejection(
+                    element=element, reason="entry must be an object", value=entry
+                )
+            )
+            continue
+        base_id = _known_id(
+            f"{element}.base_id",
+            entry.get("base_id"),
+            brief.base_ids,
+            "base identifier",
+            rejections,
+        )
+        if base_id is None:
+            continue
+        category = entry.get("category")
+        if category not in GROUND_GROUP_CATEGORIES:
+            rejections.append(
+                Rejection(
+                    element=f"{element}.category",
+                    reason="category must be one of "
+                    + ", ".join(GROUND_GROUP_CATEGORIES),
+                    value=category,
+                )
+            )
+            continue
+        key = (base_id, category)
+        if key in seen:
+            rejections.append(
+                Rejection(
+                    element=element,
+                    reason="duplicate base/category pair",
+                    value=f"{base_id}/{category}",
+                )
+            )
+            continue
+        seen.add(key)
+        orders.append(GroundGroupOrder(base_id=base_id, category=category))
     return tuple(orders)
 
 
@@ -1400,6 +1485,19 @@ def logistics_json_schema(
                     "additionalProperties": False,
                     "required": ["base_id"],
                     "properties": {"base_id": {"enum": base_ids}},
+                },
+            },
+            "ground_group_replacements": {
+                "type": "array",
+                "maxItems": MAX_ORDERS_PER_LIST,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["base_id", "category"],
+                    "properties": {
+                        "base_id": {"enum": base_ids},
+                        "category": {"enum": list(GROUND_GROUP_CATEGORIES)},
+                    },
                 },
             },
             "squadron_relocations": {

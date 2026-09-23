@@ -162,9 +162,21 @@ class BaseView:
     #: generating buildings on it), so the model can see that its budget has a
     #: physical, defendable source. ``None`` when it could not be computed.
     income_per_turn: Optional[float] = None
+    #: Degraded/destroyed static sites at this base that RED can rebuild through a
+    #: ``ground_group_replacements`` order, as ``(category, count)`` pairs where
+    #: ``category`` is one of "air_defence", "ewr", "ground". RED's own sites, so
+    #: surfacing them is not cheating.
+    replaceable_sites: tuple[tuple[str, int], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return jsonable(self)
+
+    def _render_replaceable_sites(self) -> str:
+        if not self.replaceable_sites:
+            return ""
+        return ", ".join(
+            f"{category} x{count}" for category, count in self.replaceable_sites
+        )
 
     def _render_ground_types(self) -> str:
         if not self.ground_units_by_type:
@@ -210,6 +222,9 @@ class BaseView:
         parts.append(
             f"recruit_ground={'yes' if self.can_recruit_ground_units else 'no'}"
         )
+        rebuildable = self._render_replaceable_sites()
+        if rebuildable:
+            parts.append(f"rebuildable_sites: {rebuildable}")
         if self.is_front_line_base:
             parts.append("front_line")
         return " | ".join(parts)
@@ -675,10 +690,54 @@ class OperationsProjector:
                     ),
                     squadron_ids=tuple(squadron_id_list),
                     income_per_turn=self._base_income(control_point),
+                    replaceable_sites=self._replaceable_sites(control_point),
                 )
             )
             self.resolver.bases[base_id] = control_point
         return tuple(views), max(0, len(own) - len(views))
+
+    def _replaceable_sites(self, control_point: Any) -> tuple[tuple[str, int], ...]:
+        """Count degraded/destroyed rebuildable static sites at a RED base.
+
+        Groups by the same categories the ``ground_group_replacements`` order
+        uses. Only RED's own control point is inspected, so no enemy data is
+        touched.
+        """
+
+        from game.theater.theatergroundobject import (
+            EwrGroundObject,
+            SamGroundObject,
+            VehicleGroupGroundObject,
+        )
+
+        counts = {"air_defence": 0, "ewr": 0, "ground": 0}
+        try:
+            ground_objects = list(control_point.ground_objects)
+        except Exception:  # pragma: no cover - defensive
+            return ()
+        for ground_object in ground_objects:
+            if not getattr(ground_object, "purchasable", False):
+                continue
+            try:
+                degraded = (
+                    ground_object.is_dead
+                    or ground_object.alive_unit_count < ground_object.unit_count
+                )
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if not degraded:
+                continue
+            # EwrGroundObject is a subclass of IadsGroundObject too, so test it
+            # before SamGroundObject to keep the categories disjoint.
+            if isinstance(ground_object, EwrGroundObject):
+                counts["ewr"] += 1
+            elif isinstance(ground_object, SamGroundObject):
+                counts["air_defence"] += 1
+            elif isinstance(ground_object, VehicleGroupGroundObject):
+                counts["ground"] += 1
+        return tuple(
+            (category, count) for category, count in counts.items() if count > 0
+        )
 
     def _front_line_base_ids(self) -> set[Any]:
         result: set[Any] = set()

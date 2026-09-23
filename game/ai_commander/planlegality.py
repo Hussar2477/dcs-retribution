@@ -158,6 +158,36 @@ class BoundTransfer:
 
 
 @dataclass(frozen=True)
+class BoundGroundGroupReplacement:
+    """A validated, priced order to rebuild a static site at a RED base.
+
+    ``group_plan`` is the deterministic recipe the executor replays through the
+    same ``ForceGroup.create_theater_group_for_tgo`` path the human buy menu
+    uses: one ``(group_name, unit_group, dcs_type, count)`` tuple per template
+    sub-group. ``cost`` mirrors the buy menu's ``layout price - current value``.
+    """
+
+    control_point: ControlPoint
+    ground_object: Any
+    force_group: Any
+    group_plan: tuple[tuple[str, Any, Any, int], ...]
+    cost: int
+    base_id: str
+    category: str
+    site_name: str
+
+    @property
+    def total_cost(self) -> int:
+        return self.cost
+
+    def describe(self) -> str:
+        return (
+            f"rebuild {self.category} site {self.site_name} at "
+            f"{self.base_id} ({self.cost}M)"
+        )
+
+
+@dataclass(frozen=True)
 class BoundFlight:
     mission_type: FlightType
     aircraft_count: int
@@ -190,6 +220,9 @@ class ExecutableLogistics:
     aircraft_purchases: list[BoundAircraftPurchase] = field(default_factory=list)
     ground_purchases: list[BoundGroundPurchase] = field(default_factory=list)
     runway_repairs: list[BoundRunwayRepair] = field(default_factory=list)
+    ground_group_replacements: list[BoundGroundGroupReplacement] = field(
+        default_factory=list
+    )
     relocations: list[BoundRelocation] = field(default_factory=list)
     tasking: list[BoundTasking] = field(default_factory=list)
     transfers: list[BoundTransfer] = field(default_factory=list)
@@ -200,6 +233,7 @@ class ExecutableLogistics:
             len(self.aircraft_purchases)
             + len(self.ground_purchases)
             + len(self.runway_repairs)
+            + len(self.ground_group_replacements)
             + len(self.relocations)
             + len(self.tasking)
             + len(self.transfers)
@@ -215,6 +249,7 @@ class ExecutableLogistics:
             sum(o.total_cost for o in self.aircraft_purchases)
             + sum(o.total_cost for o in self.ground_purchases)
             + sum(o.cost for o in self.runway_repairs)
+            + sum(o.cost for o in self.ground_group_replacements)
         )
 
     def describe(self) -> list[str]:
@@ -224,6 +259,7 @@ class ExecutableLogistics:
                 self.aircraft_purchases,
                 self.ground_purchases,
                 self.runway_repairs,
+                self.ground_group_replacements,
                 self.relocations,
                 self.tasking,
                 self.transfers,
@@ -377,6 +413,9 @@ class PlanLegalityChecker:
         remaining = self._check_aircraft_orders(plan, result, rejections, remaining)
         remaining = self._check_ground_orders(plan, result, rejections, remaining)
         remaining = self._check_runway_repairs(plan, result, rejections, remaining)
+        remaining = self._check_ground_group_replacements(
+            plan, result, rejections, remaining
+        )
         self._check_relocations(plan, result, rejections)
         self._check_tasking(plan, result, rejections)
         self._check_transfers(plan, result, rejections)
@@ -627,6 +666,175 @@ class PlanLegalityChecker:
                 )
             )
         return remaining
+
+    def _check_ground_group_replacements(
+        self,
+        plan: LogisticsPlan,
+        result: ExecutableLogistics,
+        rejections: list[Rejection],
+        remaining: float,
+    ) -> float:
+        """Bind and price each request to rebuild a RED static site.
+
+        Mirrors the human ``QGroundObjectBuyMenu``: pick the neediest matching
+        site at the base, choose the cheapest affordable armed-forces template,
+        and price it as ``layout price - current site value``. Everything is
+        RED-only and deterministic; nothing here reads enemy state.
+        """
+
+        from game.data.groups import GroupRole, GroupTask
+        from game.theater.theatergroundobject import (
+            EwrGroundObject,
+            SamGroundObject,
+            VehicleGroupGroundObject,
+        )
+
+        air_defence_tasks: list[GroupTask] = [
+            t
+            for t in GroupRole.AIR_DEFENSE.tasks
+            if t is not GroupTask.EARLY_WARNING_RADAR
+        ]
+        category_spec: dict[str, tuple[type, list[GroupTask]]] = {
+            "air_defence": (SamGroundObject, air_defence_tasks),
+            "ewr": (EwrGroundObject, [GroupTask.EARLY_WARNING_RADAR]),
+            "ground": (VehicleGroupGroundObject, GroupRole.GROUND_FORCE.tasks),
+        }
+
+        for index, order in enumerate(plan.ground_group_replacements):
+            element = f"ground_group_replacements[{index}]"
+            control_point = self.resolver.base(order.base_id)
+            if control_point is None or control_point.captured is not self.player:
+                rejections.append(Rejection(element, STATE_CHANGED, order.base_id))
+                continue
+            spec = category_spec.get(order.category)
+            if spec is None:  # pragma: no cover - guarded by validator
+                rejections.append(
+                    Rejection(element, "unknown category", order.category)
+                )
+                continue
+            tgo_class, tasks = spec
+            ground_object = self._neediest_site(control_point, tgo_class)
+            if ground_object is None:
+                rejections.append(
+                    Rejection(
+                        element,
+                        f"{control_point.name} has no rebuildable {order.category} site",
+                        order.base_id,
+                    )
+                )
+                continue
+            plan_and_cost = self._cheapest_template(tasks, remaining, ground_object)
+            if plan_and_cost is None:
+                rejections.append(
+                    Rejection(
+                        element,
+                        "no affordable template exists within the "
+                        f"{remaining:.0f}M uncommitted budget",
+                        order.base_id,
+                    )
+                )
+                continue
+            force_group, group_plan, cost = plan_and_cost
+            remaining -= cost
+            result.ground_group_replacements.append(
+                BoundGroundGroupReplacement(
+                    control_point=control_point,
+                    ground_object=ground_object,
+                    force_group=force_group,
+                    group_plan=group_plan,
+                    cost=cost,
+                    base_id=order.base_id,
+                    category=order.category,
+                    site_name=ground_object.name,
+                )
+            )
+        return remaining
+
+    def _neediest_site(self, control_point: ControlPoint, tgo_class: type) -> Any:
+        """Return the most-degraded purchasable site of ``tgo_class`` at the base.
+
+        Prefers a fully dead site, then the one missing the most units. Returns
+        ``None`` when every matching site is already at full strength.
+        """
+
+        best = None
+        best_missing = 0
+        for ground_object in control_point.ground_objects:
+            if not isinstance(ground_object, tgo_class):
+                continue
+            if not getattr(ground_object, "purchasable", False):
+                continue
+            missing = ground_object.unit_count - ground_object.alive_unit_count
+            if ground_object.is_dead:
+                # A dead site is always the top priority; break ties by size.
+                missing = max(missing, ground_object.unit_count, 1)
+            if missing <= 0:
+                continue
+            if missing > best_missing:
+                best = ground_object
+                best_missing = missing
+        return best
+
+    def _cheapest_template(
+        self,
+        tasks: list[Any],
+        remaining: float,
+        ground_object: Any,
+    ) -> Optional[tuple[Any, tuple[tuple[str, Any, Any, int], ...], int]]:
+        """Pick the cheapest affordable armed-forces template for ``tasks``.
+
+        Returns ``(force_group, group_plan, cost)`` or ``None`` when nothing the
+        faction owns fits the uncommitted budget. Prices deterministically using
+        each unit group's first accessible type and maximum size, matching the
+        buy menu's ``layout price - current value``.
+        """
+
+        current_value = int(getattr(ground_object, "value", 0) or 0)
+        best: Optional[tuple[Any, tuple[tuple[str, Any, Any, int], ...], int]] = None
+        for force_group in self.coalition.armed_forces.groups_for_tasks(list(tasks)):
+            for layout in force_group.layouts:
+                priced = self._price_layout(force_group, layout, current_value)
+                if priced is None:
+                    continue
+                group_plan, cost = priced
+                if cost > remaining:
+                    continue
+                if best is None or cost < best[2]:
+                    best = (force_group, group_plan, cost)
+        return best
+
+    def _price_layout(
+        self,
+        force_group: Any,
+        layout: Any,
+        current_value: int,
+    ) -> Optional[tuple[tuple[tuple[str, Any, Any, int], ...], int]]:
+        """Deterministically build and price one layout, or ``None`` if unusable."""
+
+        group_plan: list[tuple[str, Any, Any, int]] = []
+        gross = 0
+        for tgo_group in layout.groups:
+            for unit_group in tgo_group.unit_groups:
+                dcs_types = force_group.dcs_unit_types_for_group(unit_group)
+                if not dcs_types:
+                    if unit_group.optional:
+                        continue
+                    return None
+                dcs_type = dcs_types[0]
+                count = unit_group.max_size
+                if count <= 0:
+                    continue
+                unit_price = 0
+                for wrapper in force_group.unit_types_for_group(unit_group):
+                    if wrapper.dcs_unit_type is dcs_type:
+                        unit_price = int(getattr(wrapper, "price", 0) or 0)
+                        break
+                gross += unit_price * count
+                group_plan.append((tgo_group.group_name, unit_group, dcs_type, count))
+        if not group_plan:
+            return None
+        cost = max(gross - current_value, 0)
+        return tuple(group_plan), cost
 
     def _check_relocations(
         self,
