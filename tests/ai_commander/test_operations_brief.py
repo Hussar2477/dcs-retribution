@@ -355,6 +355,126 @@ class TestGroundInventoryIsListedInFull:
         assert "(+3 further types)" in rendered
 
 
+class TestFlyableCapacity:
+    """``render_flyable_capacity`` tells the air tasking stage how many airframes
+    of each type RED can actually crew and launch this turn, so it sizes packages
+    the mission planner can build. It aggregates RED's own squadrons only."""
+
+    def test_flyable_is_untasked_airframes_per_type(self) -> None:
+        _, brief = _brief()
+        rendered = brief.render_flyable_capacity()
+        # SQN-1 has 6 untasked RED-JET, SQN-2 has 4 untasked RED-BOMBER, pilot
+        # limits off in the synthetic campaign so untasked airframes are the cap.
+        assert "RED-JET: 6" in rendered
+        assert "RED-BOMBER: 4" in rendered
+        assert "total flyable: 10" in rendered
+        assert "[FLYABLE THIS TURN]" in rendered
+
+    def test_pilot_limit_caps_flyable_at_available_pilots(self) -> None:
+        # When squadron pilot limits are enabled the flyable count is the smaller
+        # of untasked airframes and available pilots -- the real crew limit.
+        view = SquadronView(
+            id="SQN-1",
+            name="1st Fighter",
+            aircraft_id="MiG-29",
+            base_id="BASE-1",
+            base_name="Anapa",
+            aircraft_on_hand=10,
+            aircraft_untasked=8,
+            aircraft_on_order=0,
+            pilots_available=3,
+            pilot_limit_enabled=True,
+            max_fulfillable_aircraft=3,
+            price_per_aircraft=10,
+            relocating_to_base_id=None,
+            capable_tasks=("CAP",),
+            auto_assignable_tasks=("CAP",),
+        )
+        brief = OperationsBrief(
+            schema_version=OPERATIONS_SCHEMA_VERSION,
+            campaign_id_hash="h",
+            campaign_revision="r",
+            turn_id=1,
+            intel_policy=IntelPolicy.REALISTIC,
+            budget_available=0.0,
+            runway_repair_cost=0,
+            bases=(),
+            squadrons=(view,),
+            targets=(),
+            plannable_mission_types=(),
+        )
+        rendered = brief.render_flyable_capacity()
+        assert "MiG-29: 3" in rendered
+        assert "total flyable: 3" in rendered
+
+    def test_no_blue_leak_in_capacity_render(self) -> None:
+        _, brief = _brief()
+        assert fakes.blue_leaks_in(brief.render_flyable_capacity()) == []
+
+
+class TestTargetReachability:
+    """A target is strikeable only where some RED squadron can both fly one of
+    its legal missions and reach it within mission range -- the same crew-and-
+    route test the planner enforces. ``reachable_by`` and the reachability render
+    expose that, using RED's own aircraft and ranges only."""
+
+    def test_in_range_capable_targets_are_marked_reachable(self) -> None:
+        _, brief = _brief()
+        # The two near air-defence targets can be struck by the fighter (SEAD)
+        # and the bomber (DEAD), both well within range.
+        tgt1 = brief.target("TGT-1")
+        tgt2 = brief.target("TGT-2")
+        assert tgt1 is not None and tgt1.reachable_by == ("RED-BOMBER", "RED-JET")
+        assert tgt2 is not None and tgt2.is_reachable
+        # The enemy airbase needs OCA, which no RED squadron can fly, so it is
+        # not strikeable this turn.
+        tgt3 = brief.target("TGT-3")
+        assert tgt3 is not None and tgt3.reachable_by == ()
+        assert not tgt3.is_reachable
+
+    def test_reachability_render_lists_reachable_and_unreachable(self) -> None:
+        _, brief = _brief()
+        rendered = brief.render_target_reachability()
+        assert "[TARGET REACHABILITY]" in rendered
+        assert "TGT-1(RED-BOMBER,RED-JET)" in rendered
+        assert "TGT-3" in rendered
+        assert "not strikeable" in rendered
+
+    def test_out_of_range_squadron_is_excluded(self) -> None:
+        # Under FULL_PARITY the distant IADS becomes visible. It is within the
+        # bomber's 900nm reach but outside the fighter's 400nm, so only the
+        # bomber may be offered -- proof the range gate actually filters.
+        _, parity = _brief(IntelPolicy.FULL_PARITY)
+        air_defence = [
+            target
+            for target in parity.targets
+            if target.category is TargetSetCategory.ENEMY_AIR_DEFENCES
+        ]
+        reach_sets = {target.reachable_by for target in air_defence}
+        assert ("RED-BOMBER",) in reach_sets  # the far site: bomber only
+        assert ("RED-BOMBER", "RED-JET") in reach_sets  # the near sites: both
+
+    def test_empty_when_no_targets(self) -> None:
+        brief = OperationsBrief(
+            schema_version=OPERATIONS_SCHEMA_VERSION,
+            campaign_id_hash="h",
+            campaign_revision="r",
+            turn_id=1,
+            intel_policy=IntelPolicy.REALISTIC,
+            budget_available=0.0,
+            runway_repair_cost=0,
+            bases=(),
+            squadrons=(),
+            targets=(),
+            plannable_mission_types=(),
+        )
+        assert brief.render_target_reachability() == ""
+
+    def test_no_blue_leak_in_reachability(self) -> None:
+        _, brief = _brief(IntelPolicy.FULL_PARITY)
+        assert fakes.blue_leaks_in(brief.render_target_reachability()) == []
+
+
 class TestShipTargetsOfferOnlyAntiShip:
     """A carrier or amphibious ship is an enemy control point, so the objective
     finder lists it among the enemy airbases. Offering it OCA/Aircraft the way a

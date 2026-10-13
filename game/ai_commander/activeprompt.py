@@ -217,6 +217,16 @@ _STAGE_BRIEFING: dict[CommanderStage, str] = {
         "reach. Plan the packages that serve your intent, committing your full "
         "usable air wing in massed, escorted packages rather than a few token "
         "flights; leftover capacity is planned for you.\n"
+        "CAPACITY AND REACH -- plan only what you can crew and reach. The "
+        "[FLYABLE THIS TURN] block lists, per airframe, how many you can "
+        "actually crew and launch this turn; size your packages to those "
+        "numbers and never commit more airframes of a type than it shows, "
+        "because the planner refuses any package it cannot crew. The [TARGET "
+        "REACHABILITY] block lists which targets your aircraft can both reach "
+        "and strike; task ONLY those, and never a target it marks not "
+        "strikeable. When capacity is tight, prefer a few properly-escorted "
+        "packages against reachable targets over many the planner cannot "
+        "build.\n"
         "DOCTRINE -- win the air first. If the after-action report shows your "
         "aircraft were lost to enemy aircraft, do NOT fly strikers into that "
         "airspace unprotected. Every strike, OCA and anti-ship package must "
@@ -394,6 +404,19 @@ def build_stage_user_prompt(
             "=== OPERATIONS BRIEFING ===",
             ops.render_compact(),
         ]
+
+    if stage is CommanderStage.AIR_TASKING:
+        # Surfaced only here (not in render_compact or the logistics prompt) to
+        # keep the other stages unchanged and the per-turn token cost down: these
+        # two blocks are what the air tasking order must size and aim itself to.
+        sections += [
+            "",
+            "=== AIR-TASKING CAPACITY AND REACH ===",
+            ops.render_flyable_capacity(),
+        ]
+        reachability = ops.render_target_reachability()
+        if reachability:
+            sections += ["", reachability]
 
     if prior_stage_summary:
         sections += [

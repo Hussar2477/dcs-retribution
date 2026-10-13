@@ -9,8 +9,16 @@ wording down.
 
 from __future__ import annotations
 
-from game.ai_commander.activeprompt import stage_briefing_text
+from game.ai_commander.activeprompt import (
+    build_stage_user_prompt,
+    stage_briefing_text,
+)
+from game.ai_commander.capabilities import CapabilityIndex, capability_index_for
+from game.ai_commander.enums import IntelPolicy
+from game.ai_commander.intel import IntelProjector, RedCommanderBrief
+from game.ai_commander.operations import OperationsBrief, OperationsProjector
 from game.ai_commander.plan import CommanderStage
+from tests.ai_commander import fakes
 
 
 class TestAirTaskingBriefing:
@@ -24,6 +32,22 @@ class TestAirTaskingBriefing:
         # The only permitted additions beyond the briefed list.
         assert "Escort" in text
         assert "SEAD Escort" in text
+
+    def test_capacity_and_reach_doctrine_is_stated(self) -> None:
+        text = self._text()
+        # Size packages to what RED can crew, and only task reachable targets.
+        assert "CAPACITY AND REACH" in text
+        assert "[FLYABLE THIS TURN]" in text
+        assert "[TARGET REACHABILITY]" in text
+        assert "crew" in text
+        assert "reach" in text
+
+    def test_other_stages_do_not_carry_capacity_and_reach(self) -> None:
+        for stage in (CommanderStage.COMMAND, CommanderStage.LOGISTICS):
+            other = stage_briefing_text(stage)
+            assert "CAPACITY AND REACH" not in other
+            assert "[FLYABLE THIS TURN]" not in other
+            assert "[TARGET REACHABILITY]" not in other
 
     def test_one_package_per_target_rule_is_stated(self) -> None:
         text = self._text()
@@ -244,3 +268,36 @@ class TestCommandBriefing:
     def test_other_stages_do_not_carry_commanders_art(self) -> None:
         for stage in (CommanderStage.LOGISTICS, CommanderStage.AIR_TASKING):
             assert "COMMANDER'S ART" not in stage_briefing_text(stage)
+
+
+class TestCapacityAndReachReachTheAirTaskingPrompt:
+    """The flyable-capacity and target-reachability blocks must be rendered into
+    the air-tasking prompt, and must not appear in the other stage prompts."""
+
+    def _ops_and_brief(
+        self,
+    ) -> tuple[RedCommanderBrief, OperationsBrief, CapabilityIndex]:
+        campaign, game = fakes.synthetic_game()
+        brief = IntelProjector(game, IntelPolicy.REALISTIC).project()
+        ops = OperationsProjector(game, IntelPolicy.REALISTIC).project(
+            brief.campaign_id_hash, brief.campaign_revision
+        )
+        capabilities = capability_index_for(campaign.red)
+        return brief, ops, capabilities
+
+    def test_blocks_render_in_air_tasking_prompt(self) -> None:
+        brief, ops, capabilities = self._ops_and_brief()
+        prompt = build_stage_user_prompt(
+            CommanderStage.AIR_TASKING, brief, ops, capabilities
+        )
+        assert "AIR-TASKING CAPACITY AND REACH" in prompt
+        assert "[FLYABLE THIS TURN]" in prompt
+        assert "[TARGET REACHABILITY]" in prompt
+
+    def test_blocks_absent_from_logistics_prompt(self) -> None:
+        brief, ops, capabilities = self._ops_and_brief()
+        prompt = build_stage_user_prompt(
+            CommanderStage.LOGISTICS, brief, ops, capabilities
+        )
+        assert "[FLYABLE THIS TURN]" not in prompt
+        assert "[TARGET REACHABILITY]" not in prompt

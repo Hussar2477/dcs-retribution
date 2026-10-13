@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional, Sequence
 
 from game.ato.flighttype import FlightType
 from game.config import RUNWAY_REPAIR_COST
-from game.utils import meters
+from game.utils import meters, nautical_miles
 
 from .enums import IntelPolicy, TargetSetCategory
 from .serialization import jsonable
@@ -303,6 +303,17 @@ class TargetView:
     #: derrick or oil rig is a high-value deep strike that starves the enemy
     #: budget. ``None`` for categories that generate no income.
     income_value: Optional[float] = None
+    #: Sorted RED aircraft variant ids that can both fly one of this target's
+    #: ``legal_missions`` AND reach it within mission range -- i.e. the airframes
+    #: the mission planner would actually be able to crew and route against it.
+    #: Empty means no RED squadron can strike it this turn (out of range, or no
+    #: capable airframe). Only RED's own aircraft and ranges, so no enemy data is
+    #: exposed.
+    reachable_by: tuple[str, ...] = ()
+
+    @property
+    def is_reachable(self) -> bool:
+        return bool(self.reachable_by)
 
     def to_dict(self) -> dict[str, Any]:
         return jsonable(self)
@@ -425,6 +436,74 @@ class OperationsBrief:
         ]
         if self.withheld_fields:
             lines += ["", "[WITHHELD]", ",".join(self.withheld_fields)]
+        return "\n".join(lines)
+
+    def render_flyable_capacity(self) -> str:
+        """Per-airframe count RED can actually crew and launch this turn.
+
+        The mission planner refuses any package it cannot crew, so this is the
+        ceiling the air tasking order must size itself to. The figure is the real
+        per-turn limit a squadron can put up: its untasked airframes, capped by
+        its available pilots when squadron pilot limits are enabled. These are
+        RED's own squadrons, so surfacing them is not cheating. Aggregated by
+        airframe to keep the block to a line or two.
+        """
+
+        totals: dict[str, int] = {}
+        for squadron in self.squadrons:
+            if squadron.pilot_limit_enabled:
+                flyable = min(squadron.aircraft_untasked, squadron.pilots_available)
+            else:
+                flyable = squadron.aircraft_untasked
+            flyable = max(0, flyable)
+            totals[squadron.aircraft_id] = totals.get(squadron.aircraft_id, 0) + flyable
+        lines = [
+            "[FLYABLE THIS TURN] airframes RED can crew and launch now; size "
+            "your packages to these numbers -- the planner refuses any package "
+            "it cannot crew.",
+        ]
+        if totals:
+            lines.append(
+                ", ".join(
+                    f"{aircraft}: {count}" for aircraft, count in sorted(totals.items())
+                )
+            )
+            lines.append(f"total flyable: {sum(totals.values())}")
+        else:
+            lines.append("(no squadrons available)")
+        return "\n".join(lines)
+
+    def render_target_reachability(self) -> str:
+        """Which listed targets RED can both reach and strike this turn.
+
+        A target is strikeable only where some RED squadron is both capable of
+        one of its legal missions and within mission range of it -- the same
+        crew-and-route test the mission planner enforces. Everything else must
+        not be tasked, because the planner would reject it. Only RED's own
+        aircraft and ranges are used, so this exposes no enemy data. Returns an
+        empty string when there are no identified targets.
+        """
+
+        if not self.targets:
+            return ""
+        reachable: list[str] = []
+        unreachable: list[str] = []
+        for target in self.targets:
+            if target.reachable_by:
+                reachable.append(f"{target.id}({','.join(target.reachable_by)})")
+            else:
+                unreachable.append(target.id)
+        lines = [
+            "[TARGET REACHABILITY] task ONLY targets your aircraft can reach and "
+            "strike; the planner refuses the rest.",
+        ]
+        if reachable:
+            lines.append("reachable: " + ", ".join(reachable))
+        if unreachable:
+            lines.append(
+                "not strikeable now (out of range or no capable airframe; do NOT "
+                "task): " + ", ".join(unreachable)
+            )
         return "\n".join(lines)
 
 
@@ -931,6 +1010,56 @@ class OperationsProjector:
         except Exception:  # pragma: no cover - defensive
             return False
 
+    def _within_mission_range(self, squadron: Any, position: Any) -> bool:
+        """True when ``squadron`` could reach ``position`` in one mission.
+
+        Mirrors :meth:`Squadron.can_auto_assign_mission`'s range gate exactly: the
+        straight-line distance from the squadron's home base to the target, versus
+        the larger of the airframe's own ``max_mission_range`` and the campaign's
+        ``max_mission_range_planes`` / ``..._helicopters`` setting. Using the same
+        test the planner uses is what keeps the brief honest.
+        """
+
+        location = getattr(squadron, "location", None)
+        aircraft = getattr(squadron, "aircraft", None)
+        max_range = getattr(aircraft, "max_mission_range", None)
+        if location is None or max_range is None or position is None:
+            return False
+        try:
+            distance = meters(location.position.distance_to_point(position))
+        except Exception:  # pragma: no cover - defensive
+            return False
+        settings = self.game.settings
+        plane_cap = nautical_miles(getattr(settings, "max_mission_range_planes", 150))
+        heli_cap = nautical_miles(
+            getattr(settings, "max_mission_range_helicopters", 100)
+        )
+        if bool(getattr(aircraft, "helicopter", False)):
+            return distance <= max(max_range, heli_cap)
+        return distance <= max(max_range, plane_cap)
+
+    def _reachable_aircraft_types(
+        self, position: Any, missions: frozenset[FlightType]
+    ) -> tuple[str, ...]:
+        """Sorted RED aircraft variant ids that can both fly one of ``missions``
+        against a target at ``position`` and reach it within mission range.
+
+        Only RED's own squadrons are inspected, so nothing about the enemy is
+        exposed beyond the already-listed target.
+        """
+
+        if position is None or not missions:
+            return ()
+        types: set[str] = set()
+        for squadron in self._safe(self._coalition().air_wing.iter_squadrons):
+            if not any(self._squadron_capable(squadron, task) for task in missions):
+                continue
+            if not self._within_mission_range(squadron, position):
+                continue
+            aircraft = getattr(squadron, "aircraft", None)
+            types.add(str(getattr(aircraft, "variant_id", "unknown")))
+        return tuple(sorted(types))
+
     # -- enemy objectives -------------------------------------------------
 
     def _project_targets(
@@ -1020,6 +1149,9 @@ class OperationsProjector:
                     legal_missions=tuple(sorted(m.value for m in missions)),
                     notes=note,
                     income_value=self._target_income(objective),
+                    reachable_by=self._reachable_aircraft_types(
+                        getattr(objective, "position", None), missions
+                    ),
                 )
             )
         return tuple(views), max(0, len(ranked) - len(views))
