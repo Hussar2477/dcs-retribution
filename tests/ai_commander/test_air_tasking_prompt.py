@@ -42,6 +42,16 @@ class TestAirTaskingBriefing:
         assert "crew" in text
         assert "reach" in text
 
+    def test_compactness_and_anti_truncation_instruction_is_stated(self) -> None:
+        # A runaway air reply overran the output budget and was cut off before
+        # the JSON closed; the stage must now tell the model to stay compact.
+        text = self._text()
+        assert "KEEP THE OUTPUT COMPACT" in text
+        assert "single concise JSON object" in text
+        assert "cut off" in text
+        # Prefer a few larger packages over many tiny single-flight ones.
+        assert "single-flight" in text
+
     def test_other_stages_do_not_carry_capacity_and_reach(self) -> None:
         for stage in (CommanderStage.COMMAND, CommanderStage.LOGISTICS):
             other = stage_briefing_text(stage)

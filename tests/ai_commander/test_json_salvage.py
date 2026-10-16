@@ -10,6 +10,7 @@ never raises whatever it is given.
 
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 from game.ai_commander.jsonsalvage import salvage_truncated_json
@@ -59,6 +60,66 @@ class TestRecoversTheCompletePrefix:
     def test_a_complete_object_is_returned_unchanged(self) -> None:
         text = '{"a": [1, 2, 3], "b": "ok"}'
         assert salvage_truncated_json(text) == {"a": [1, 2, 3], "b": "ok"}
+
+
+class TestAirTaskingTruncation:
+    """The turn-10 failure: a runaway air-tasking reply cut off at the output
+    budget. Salvage must recover the packages the model did finish."""
+
+    def test_it_recovers_packages_from_a_reply_cut_off_mid_array(self) -> None:
+        # One complete package, then a second cut off before any field closed.
+        text = (
+            '{"schema_version": "air-tasking-v1", "turn_id": "t10", '
+            '"packages": ['
+            '{"target_id": "TGT-1", "flights": ['
+            '{"squadron_id": "SQN-1", "mission_type": "OCA/Aircraft", "count": 4}]}, '
+            '{"target_id": "TGT-2", "flig'
+        )
+        recovered = salvage_truncated_json(text)
+        assert recovered is not None
+        assert recovered["schema_version"] == "air-tasking-v1"
+        assert recovered["turn_id"] == "t10"
+        # The complete first package survives intact and is usable as-is.
+        assert recovered["packages"][0] == {
+            "target_id": "TGT-1",
+            "flights": [
+                {"squadron_id": "SQN-1", "mission_type": "OCA/Aircraft", "count": 4}
+            ],
+        }
+        # Nothing fabricated: the half-written second package keeps no flights,
+        # so the ordinary validator drops it downstream.
+        assert recovered["packages"][1].get("flights", []) == []
+
+    def test_it_recovers_the_complete_flights_from_a_package_cut_mid_object(
+        self,
+    ) -> None:
+        # A package whose flights array holds one complete flight and a second
+        # cut off mid-object (a trailing partial element).
+        text = (
+            '{"schema_version": "air-tasking-v1", "packages": ['
+            '{"target_id": "TGT-1", "flights": ['
+            '{"squadron_id": "SQN-1", "mission_type": "OCA/Aircraft", "count": 4}, '
+            '{"squadron_id": "SQN-2", "mission'
+        )
+        recovered = salvage_truncated_json(text)
+        assert recovered is not None
+        flights = recovered["packages"][0]["flights"]
+        # The finished flight is kept; the half-written one carries no mission.
+        assert flights[0] == {
+            "squadron_id": "SQN-1",
+            "mission_type": "OCA/Aircraft",
+            "count": 4,
+        }
+        assert "mission_type" not in flights[1]
+
+    def test_a_well_formed_air_tasking_reply_is_returned_unchanged(self) -> None:
+        text = (
+            '{"schema_version": "air-tasking-v1", "turn_id": "t10", '
+            '"packages": [{"target_id": "TGT-1", "flights": '
+            '[{"squadron_id": "SQN-1", "mission_type": "OCA/Aircraft", "count": 4}]}]}'
+        )
+        # A valid reply must never be altered or corrupted by salvage.
+        assert salvage_truncated_json(text) == json.loads(text)
 
 
 class TestNothingRecoverable:
