@@ -6,3 +6,4 @@ Developer documentation
    :caption: Contents:
 
    design/index.rst
+   ai_commander.md

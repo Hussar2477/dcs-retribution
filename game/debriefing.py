@@ -127,6 +127,14 @@ class StateData:
     #: Mangled names of bases that were captured during the mission.
     base_capture_events: List[str]
 
+    #: Per-kill cause records emitted by the DCS mission script for
+    #: S_EVENT_KILL. Each element is a mapping with at least ``target`` (the
+    #: victim's unit name) and, when DCS reported them, ``by`` (the killer's
+    #: unit name), ``by_type`` (the killer's DCS type name) and ``weapon`` (the
+    #: weapon's DCS type name). Auto-resolved (non-DCS) combat produces no such
+    #: records, so this may be empty even when there were losses.
+    kill_causes: List[Dict[str, str]] = field(default_factory=list)
+
     @classmethod
     def from_json(cls, data: Dict[str, Any], unit_map: UnitMap) -> StateData:
         def clean_unit_list(unit_list: List[Any]) -> List[str]:
@@ -159,16 +167,26 @@ class StateData:
             else:
                 killed_ground_units.append(unit)
 
+        kill_causes = [
+            cause
+            for cause in data.get("kill_causes", [])
+            if isinstance(cause, dict) and cause.get("target")
+        ]
+
         return cls(
             mission_ended=data.get("mission_ended", False),
             killed_aircraft=killed_aircraft,
             killed_ground_units=killed_ground_units,
             destroyed_statics=data.get("destroyed_objects_positions", []),
             base_capture_events=data.get("base_capture_events", []),
+            kill_causes=kill_causes,
         )
 
 
 class Debriefing:
+    air_losses: AirLosses
+    ground_losses: GroundLosses
+
     def __init__(
         self, state_data: Dict[str, Any], game: Game, unit_map: UnitMap
     ) -> None:

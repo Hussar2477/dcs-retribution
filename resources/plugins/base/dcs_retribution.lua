@@ -8,6 +8,7 @@ crash_events = {} -- killed aircraft will be added via S_EVENT_CRASH event
 dead_events = {} -- killed units will be added via S_EVENT_DEAD event
 unit_lost_events = {} -- killed units will be added via S_EVENT_UNIT_LOST
 kill_events = {} -- killed units will be added via S_EVENT_KILL 
+kill_causes = {} -- who/what killed each unit, added via S_EVENT_KILL (target -> killer)
 base_capture_events = {}
 destroyed_objects_positions = {} -- will be added via S_EVENT_DEAD event
 mission_ended = false
@@ -43,8 +44,9 @@ function write_state()
         ["crash_events"] = crash_events,
         ["dead_events"] = dead_events,
         ["base_capture_events"] = base_capture_events,
-		["unit_lost_events"] = unit_lost_events,
-		["kill_events"] = kill_events,
+                ["unit_lost_events"] = unit_lost_events,
+                ["kill_events"] = kill_events,
+                ["kill_causes"] = kill_causes,
         ["mission_ended"] = mission_ended,
         ["destroyed_objects_positions"] = destroyed_objects_positions,
     }
@@ -177,9 +179,30 @@ local function onEvent(event)
         unit_lost_events[#unit_lost_events + 1] = event.initiator.getName(event.initiator)
         dirty_state = true
     end
-	
-	if event.id == world.event.S_EVENT_KILL and event.target then
-        kill_events[#kill_events + 1] = event.target.getName(event.target)
+        
+        if event.id == world.event.S_EVENT_KILL and event.target then
+        local target_name = event.target.getName(event.target)
+        kill_events[#kill_events + 1] = target_name
+        -- Record the cause of the kill so Retribution can attribute a coalition's
+        -- losses to what destroyed them (enemy aircraft, SAM, ship, AAA, ...).
+        -- Every DCS getter is wrapped defensively: initiator/weapon may be nil
+        -- (e.g. crashes counted as kills), and getName/getTypeName can error on
+        -- objects mid-destruction. A failed lookup simply leaves the field nil.
+        local cause = { ["target"] = target_name }
+        if event.initiator then
+            pcall(function()
+                cause["by"] = event.initiator.getName(event.initiator)
+            end)
+            pcall(function()
+                cause["by_type"] = event.initiator:getTypeName()
+            end)
+        end
+        if event.weapon then
+            pcall(function()
+                cause["weapon"] = event.weapon:getTypeName()
+            end)
+        end
+        kill_causes[#kill_causes + 1] = cause
         dirty_state = true
     end
 

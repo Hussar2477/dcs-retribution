@@ -21,6 +21,8 @@ from game.threatzones import ThreatZones
 from game.transfers import PendingTransfers
 
 if TYPE_CHECKING:
+    from game.ai_commander.directive import CommanderDirective
+
     from .campaignloader import CampaignAirWingConfig
     from .data.doctrine import Doctrine
     from .factions.faction import Faction
@@ -44,6 +46,12 @@ class Coalition:
         self.air_wing = AirWing(player, game, self.faction)
         self.armed_forces = ArmedForces(self.faction)
         self.transfers = PendingTransfers(game, player)
+
+        # Serialised after-action summary from the last resolved mission, used by
+        # the LLM AI commander to reason about what happened. A plain dict (see
+        # game.ai_commander.debrief.DebriefSummary.to_dict) so it survives
+        # save/load without pulling ai_commander into the coalition module.
+        self.last_after_action: Optional[dict[str, Any]] = None
 
         # Late initialized because the two coalitions in the game are mutually
         # dependent, so must be both constructed before this property can be set.
@@ -111,6 +119,10 @@ class Coalition:
                 state["player"] = Player.RED
 
         self.__dict__.update(state)
+        # Backward compatibility: saves created before the AI after-action
+        # summary existed have no such attribute.
+        if not hasattr(self, "last_after_action"):
+            self.last_after_action = None
 
     def set_opponent(self, opponent: Coalition) -> None:
         if self._opponent is not None:
@@ -189,9 +201,39 @@ class Coalition:
         with logged_duration("Transport planning"):
             self.transfers.plan_transports(self.game.conditions.start_time)
 
+        directive = self.request_commander_directive()
+
         if not is_turn_0:
-            self.plan_missions(self.game.conditions.start_time)
-        self.plan_procurement()
+            self.plan_missions(self.game.conditions.start_time, directive)
+        self.plan_procurement(directive)
+
+        if directive is not None:
+            # Front line stances are applied after mission planning because the
+            # built-in planner only ever escalates a stance, so applying the
+            # commander's postures first would let the planner override them.
+            from game.ai_commander import apply_front_postures
+
+            with logged_duration("RED commander posture application"):
+                apply_front_postures(self, directive)
+
+    def request_commander_directive(self) -> Optional[CommanderDirective]:
+        """Ask the LLM commander for this coalition's directive, if enabled.
+
+        Returns ``None`` -- meaning "plan exactly as Retribution always has" --
+        for BLUE, when the feature is disabled, and on every failure path inside
+        the commander. Errors are handled there and never surface here, so this
+        cannot break turn initialization.
+        """
+
+        if not self.player.is_red:
+            return None
+        if not getattr(self.game.settings, "ai_commander_enabled", False):
+            return None
+
+        from game.ai_commander import plan_red_commander_turn
+
+        with logged_duration("RED commander decision"):
+            return plan_red_commander_turn(self)
 
     def refund_outstanding_orders(self) -> None:
         # TODO: Split orders between air and ground units.
@@ -206,18 +248,27 @@ class Coalition:
         for squadron in self.air_wing.iter_squadrons():
             squadron.refund_orders()
 
-    def plan_missions(self, now: datetime) -> None:
+    def plan_missions(
+        self, now: datetime, directive: Optional[CommanderDirective] = None
+    ) -> None:
         color = "Blue" if self.player.is_blue else "Red"
+        commander: TheaterCommander
+        if directive is None:
+            commander = TheaterCommander(self.game, self.player)
+        else:
+            from game.ai_commander import DirectedTheaterCommander
+
+            commander = DirectedTheaterCommander(self.game, self.player, directive)
         with MultiEventTracer() as tracer:
             with tracer.trace(f"{color} mission planning"):
                 with tracer.trace(f"{color} mission identification"):
-                    TheaterCommander(self.game, self.player).plan_missions(now, tracer)
+                    commander.plan_missions(now, tracer)
                 with tracer.trace(f"{color} mission scheduling"):
                     MissionScheduler(
                         self, self.game.settings.desired_player_mission_duration
                     ).schedule_missions(now)
 
-    def plan_procurement(self) -> None:
+    def plan_procurement(self, directive: Optional[CommanderDirective] = None) -> None:
         # The first turn needs to buy a *lot* of aircraft to fill CAPs, so it gets much
         # more of the budget that turn. Otherwise budget (after repairs) is split evenly
         # between air and ground. For the default starting budget of 2000 this gives 600
@@ -233,14 +284,29 @@ class Coalition:
             manage_front_line = True
             manage_aircraft = True
 
-        self.budget = ProcurementAi(
-            self.game,
-            self.player,
-            self.faction,
-            manage_runways,
-            manage_front_line,
-            manage_aircraft,
-        ).spend_budget(self.budget)
+        procurement: ProcurementAi
+        if directive is None:
+            procurement = ProcurementAi(
+                self.game,
+                self.player,
+                self.faction,
+                manage_runways,
+                manage_front_line,
+                manage_aircraft,
+            )
+        else:
+            from game.ai_commander import DirectedProcurementAi
+
+            procurement = DirectedProcurementAi(
+                self.game,
+                self.player,
+                self.faction,
+                manage_runways,
+                manage_front_line,
+                manage_aircraft,
+                directive,
+            )
+        self.budget = procurement.spend_budget(self.budget)
 
     def add_procurement_request(self, request: AircraftProcurementRequest) -> None:
         self.procurement_requests.add(request)

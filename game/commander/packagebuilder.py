@@ -81,6 +81,7 @@ class PackageBuilder:
             plan.task,
             start_type,
             divert=self.find_divert_field(squadron.aircraft, squadron.location),
+            ingress_band=plan.ingress_band,
         )
         for member in flight.iter_members():
             apply_default_player_laser_code(

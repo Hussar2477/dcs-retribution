@@ -54,6 +54,27 @@ class MissionResultsProcessor:
                 self.commit_captures(debriefing, events)
             with logged_duration("record_carcasses"):
                 self.record_carcasses(debriefing)
+            with logged_duration("record_red_after_action"):
+                self.record_red_after_action(debriefing)
+
+    def record_red_after_action(self, debriefing: Debriefing) -> None:
+        """Store a RED-perspective after-action summary for the AI commander.
+
+        This is a compact, fair debrief (RED's own losses attributed to their
+        causes, plus BLUE losses RED confirmed) that the LLM commander reads on
+        its next turn. It is best-effort: any failure here must never abort the
+        mission commit, so it is fully guarded.
+        """
+
+        # Imported lazily to avoid a package-level import cycle
+        # (game.ai_commander imports game internals that import this module).
+        try:
+            from game.ai_commander.debrief import build_debrief_summary
+
+            summary = build_debrief_summary(debriefing, self.game)
+            self.game.red.last_after_action = summary.to_dict()
+        except Exception:  # noqa: BLE001 - never let the debrief break a commit
+            logging.exception("Failed to build RED after-action summary")
 
     def commit_air_losses(self, debriefing: Debriefing) -> None:
         for loss in debriefing.air_losses.losses:
